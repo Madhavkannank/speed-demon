@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::thread;
@@ -39,6 +39,45 @@ type FastBuildHasher = BuildHasherDefault<FastHasher>;
 #[inline(always)]
 fn intersect_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
+    if a.is_empty() || b.is_empty() {
+        return;
+    }
+    if b.len() > a.len() * 32 {
+        let mut b_slice = b;
+        for &val in a {
+            match b_slice.binary_search(&val) {
+                Ok(idx) => {
+                    out.push(val);
+                    b_slice = &b_slice[idx + 1..];
+                }
+                Err(idx) => {
+                    b_slice = &b_slice[idx..];
+                }
+            }
+            if b_slice.is_empty() {
+                break;
+            }
+        }
+        return;
+    }
+    if a.len() > b.len() * 32 {
+        let mut a_slice = a;
+        for &val in b {
+            match a_slice.binary_search(&val) {
+                Ok(idx) => {
+                    out.push(val);
+                    a_slice = &a_slice[idx + 1..];
+                }
+                Err(idx) => {
+                    a_slice = &a_slice[idx..];
+                }
+            }
+            if a_slice.is_empty() {
+                break;
+            }
+        }
+        return;
+    }
     let mut i = 0;
     let mut j = 0;
     while i < a.len() && j < b.len() {
@@ -102,18 +141,54 @@ fn difference_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 }
 
 #[inline(always)]
-fn write_results<W: Write>(writer: &mut W, ids: &[u32]) -> std::io::Result<()> {
+fn append_u64(buf: &mut Vec<u8>, mut n: u64) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut temp = [0u8; 20];
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        temp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    buf.extend_from_slice(&temp[i..]);
+}
+
+#[inline(always)]
+fn append_u32(buf: &mut Vec<u8>, mut n: u32) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut temp = [0u8; 10];
+    let mut i = 10;
+    while n > 0 {
+        i -= 1;
+        temp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    buf.extend_from_slice(&temp[i..]);
+}
+
+#[inline(always)]
+fn fast_write_results(buf: &mut Vec<u8>, ids: &[u32]) {
     let count = ids.len();
     if count == 0 {
-        return writeln!(writer, "0 0");
+        buf.extend_from_slice(b"0 0\n");
+        return;
     }
     let sum: u64 = ids.iter().map(|&x| x as u64).sum();
-    write!(writer, "{} {}", count, sum)?;
+    append_u32(buf, count as u32);
+    buf.push(b' ');
+    append_u64(buf, sum);
     let take = count.min(10);
     for &id in &ids[..take] {
-        write!(writer, " {}", id)?;
+        buf.push(b' ');
+        append_u32(buf, id);
     }
-    writeln!(writer)
+    buf.push(b'\n');
 }
 
 enum ParsedQuery {
@@ -227,121 +302,201 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Phase 2: Index documents using streaming chunks
+    // Phase 2: Parallel document indexing across 6 workers
     let vocab_size = vocab.len();
-    let mut index: Vec<Vec<u32>> = (0..vocab_size).map(|_| Vec::new()).collect();
-    let mut last_seen_doc = vec![u32::MAX; vocab_size];
-
-    let mut doc_text_offsets: Vec<u64> = Vec::with_capacity(260_000);
-    let mut doc_text_lens: Vec<u32> = Vec::with_capacity(260_000);
-
     let docs_file = File::open(&docs_path)?;
-    let mut chunk_buf = vec![0u8; 4 * 1024 * 1024];
-    let mut remainder = Vec::new();
-    let mut reader = BufReader::with_capacity(1024 * 1024, &docs_file);
-    let mut current_file_offset = 0u64;
-    let mut doc_id = 0u32;
+    let file_len = docs_file.metadata()?.len() as usize;
 
-    loop {
-        let rem_len = remainder.len();
-        if rem_len > 0 {
-            chunk_buf[..rem_len].copy_from_slice(&remainder);
-            remainder.clear();
+    const NUM_INDEX_WORKERS: usize = 6;
+    let approx_chunk = file_len / NUM_INDEX_WORKERS;
+    let mut chunk_bounds = Vec::with_capacity(NUM_INDEX_WORKERS + 1);
+    chunk_bounds.push(0);
+
+    let mut scan_buf = vec![0u8; 4096];
+    for i in 1..NUM_INDEX_WORKERS {
+        let approx_pos = i * approx_chunk;
+        docs_file.read_exact_at(&mut scan_buf, approx_pos as u64)?;
+        let mut offset = 0;
+        while offset < scan_buf.len() && scan_buf[offset] != b'\n' {
+            offset += 1;
         }
-        let n = reader.read(&mut chunk_buf[rem_len..])?;
-        if n == 0 && rem_len == 0 {
-            break;
-        }
-        let total_len = rem_len + n;
-        let mut last_nl = total_len;
-        while last_nl > 0 && chunk_buf[last_nl - 1] != b'\n' {
-            last_nl -= 1;
-        }
+        chunk_bounds.push(approx_pos + offset + 1);
+    }
+    chunk_bounds.push(file_len);
+    drop(scan_buf);
 
-        let valid_len = if n == 0 {
-            total_len
-        } else if last_nl > 0 {
-            remainder.extend_from_slice(&chunk_buf[last_nl..total_len]);
-            last_nl
-        } else {
-            remainder.extend_from_slice(&chunk_buf[..total_len]);
-            current_file_offset += total_len as u64;
-            continue;
-        };
+    struct WorkerIndexData {
+        index: Vec<Vec<u32>>,
+        doc_text_offsets: Vec<u64>,
+        doc_text_lens: Vec<u32>,
+    }
 
-        let slice = &chunk_buf[..valid_len];
-        let mut p = 0;
-        while p < valid_len {
-            // Scan doc_id up to TAB
-            while p < valid_len && slice[p] != b'\t' && slice[p] != b'\n' {
-                p += 1;
-            }
-            if p >= valid_len {
-                break;
-            }
-            let text_start = if slice[p] == b'\t' {
-                p += 1;
-                p
-            } else {
-                p
-            };
+    let mut worker_data: Vec<WorkerIndexData> = Vec::with_capacity(NUM_INDEX_WORKERS);
+    thread::scope(|s| {
+        let mut handles = Vec::with_capacity(NUM_INDEX_WORKERS);
+        let bloom_ref = &bloom;
+        let vocab_ref = &vocab;
+        let docs_path_ref = &docs_path;
 
-            let text_file_offset = current_file_offset + text_start as u64;
+        for w_idx in 0..NUM_INDEX_WORKERS {
+            let start_pos = chunk_bounds[w_idx];
+            let end_pos = chunk_bounds[w_idx + 1];
 
-            // Tokenize document text until '\n'
-            while p < valid_len && slice[p] != b'\n' {
-                let b = slice[p];
-                if b.is_ascii_alphanumeric() {
-                    let start = p;
-                    let mut hash = 0x517cc1b727220a95u64;
-                    let mut count = 0;
-                    while p < valid_len && slice[p].is_ascii_alphanumeric() {
-                        if count < 32 {
-                            let lb = slice[p].to_ascii_lowercase();
-                            hash = hash.rotate_left(5) ^ (lb as u64);
-                            hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
-                            count += 1;
-                        }
-                        p += 1;
+            handles.push(s.spawn(move || {
+                let d_file = File::open(docs_path_ref).unwrap();
+                let mut local_index: Vec<Vec<u32>> = (0..vocab_size).map(|_| Vec::new()).collect();
+                let mut last_seen = vec![u32::MAX; vocab_size];
+                let mut text_offsets = Vec::with_capacity(45_000);
+                let mut text_lens = Vec::with_capacity(45_000);
+
+                let mut chunk_buf = vec![0u8; 4 * 1024 * 1024];
+                let mut cur_offset = start_pos;
+                let mut rem_len = 0;
+
+                while cur_offset < end_pos || rem_len > 0 {
+                    let to_read = (4 * 1024 * 1024 - rem_len).min(end_pos.saturating_sub(cur_offset));
+                    let read_bytes = if to_read > 0 {
+                        d_file.read_exact_at(&mut chunk_buf[rem_len..rem_len + to_read], cur_offset as u64).unwrap();
+                        cur_offset += to_read;
+                        to_read
+                    } else {
+                        0
+                    };
+
+                    let total_available = rem_len + read_bytes;
+                    if total_available == 0 {
+                        break;
                     }
 
-                    let b1 = (hash & 0x7FFFF) as usize;
-                    let b2 = ((hash >> 20) & 0x7FFFF) as usize;
-                    let in_bloom = ((bloom[b1 >> 6] >> (b1 & 63)) & 1) != 0
-                                && ((bloom[b2 >> 6] >> (b2 & 63)) & 1) != 0;
+                    let mut last_nl = total_available;
+                    while last_nl > 0 && chunk_buf[last_nl - 1] != b'\n' {
+                        last_nl -= 1;
+                    }
 
-                    if in_bloom {
-                        let mut lower = [0u8; 32];
-                        for k in 0..count {
-                            lower[k] = slice[start + k].to_ascii_lowercase();
+                    let slice = &chunk_buf[..last_nl];
+                    let mut p = 0;
+                    while p < last_nl {
+                        // Scan doc_id up to TAB
+                        let mut doc_id = 0u32;
+                        while p < last_nl && slice[p] >= b'0' && slice[p] <= b'9' {
+                            doc_id = doc_id * 10 + (slice[p] - b'0') as u32;
+                            p += 1;
                         }
-                        let key = &lower[..count];
-                        if let Some(&id) = vocab.get(key) {
-                            let id_usize = id as usize;
-                            if last_seen_doc[id_usize] != doc_id {
-                                last_seen_doc[id_usize] = doc_id;
-                                index[id_usize].push(doc_id);
+                        while p < last_nl && slice[p] != b'\t' && slice[p] != b'\n' {
+                            p += 1;
+                        }
+                        if p >= last_nl {
+                            break;
+                        }
+                        let text_start = if slice[p] == b'\t' {
+                            p += 1;
+                            p
+                        } else {
+                            p
+                        };
+
+                        let text_file_offset = (cur_offset - total_available + text_start) as u64;
+
+                        // Tokenize document text until '\n'
+                        while p < last_nl && slice[p] != b'\n' {
+                            let b = slice[p];
+                            if b.is_ascii_alphanumeric() {
+                                let start = p;
+                                let mut hash = 0x517cc1b727220a95u64;
+                                let mut count = 0;
+                                while p < last_nl && slice[p].is_ascii_alphanumeric() {
+                                    if count < 32 {
+                                        let lb = slice[p].to_ascii_lowercase();
+                                        hash = hash.rotate_left(5) ^ (lb as u64);
+                                        hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
+                                        count += 1;
+                                    }
+                                    p += 1;
+                                }
+
+                                let b1 = (hash & 0x7FFFF) as usize;
+                                let b2 = ((hash >> 20) & 0x7FFFF) as usize;
+                                let in_bloom = ((bloom_ref[b1 >> 6] >> (b1 & 63)) & 1) != 0
+                                            && ((bloom_ref[b2 >> 6] >> (b2 & 63)) & 1) != 0;
+
+                                if in_bloom {
+                                    let mut lower = [0u8; 32];
+                                    for k in 0..count {
+                                        lower[k] = slice[start + k].to_ascii_lowercase();
+                                    }
+                                    let key = &lower[..count];
+                                    if let Some(&id) = vocab_ref.get(key) {
+                                        let id_usize = id as usize;
+                                        if last_seen[id_usize] != doc_id {
+                                            last_seen[id_usize] = doc_id;
+                                            local_index[id_usize].push(doc_id);
+                                        }
+                                    }
+                                }
+                            } else {
+                                p += 1;
                             }
                         }
+
+                        let text_end = p;
+                        let text_len = (text_end - text_start) as u32;
+                        text_offsets.push(text_file_offset);
+                        text_lens.push(text_len);
+
+                        if p < last_nl && slice[p] == b'\n' {
+                            p += 1;
+                        }
                     }
-                } else {
-                    p += 1;
+
+                    rem_len = total_available - last_nl;
+                    if rem_len > 0 {
+                        chunk_buf.copy_within(last_nl..total_available, 0);
+                    }
                 }
-            }
 
-            let text_end = p;
-            let text_len = (text_end - text_start) as u32;
-            doc_text_offsets.push(text_file_offset);
-            doc_text_lens.push(text_len);
-            doc_id += 1;
-
-            if p < valid_len && slice[p] == b'\n' {
-                p += 1;
-            }
+                WorkerIndexData {
+                    index: local_index,
+                    doc_text_offsets: text_offsets,
+                    doc_text_lens: text_lens,
+                }
+            }));
         }
 
-        current_file_offset += valid_len as u64;
+        for h in handles {
+            worker_data.push(h.join().unwrap());
+        }
+    });
+
+    // Merge worker indices into a single Compressed Sparse Row (CSR) flat array
+    let mut offsets = vec![0u32; vocab_size + 1];
+    for w in &worker_data {
+        for (tid, list) in w.index.iter().enumerate() {
+            offsets[tid + 1] += list.len() as u32;
+        }
     }
+    for i in 0..vocab_size {
+        offsets[i + 1] += offsets[i];
+    }
+    let total_postings = offsets[vocab_size] as usize;
+    let mut all_postings = vec![0u32; total_postings];
+
+    let mut cur_pos = offsets.clone();
+    for w in &worker_data {
+        for (tid, list) in w.index.iter().enumerate() {
+            let dest_start = cur_pos[tid] as usize;
+            let dest_end = dest_start + list.len();
+            all_postings[dest_start..dest_end].copy_from_slice(list);
+            cur_pos[tid] += list.len() as u32;
+        }
+    }
+
+    let mut doc_text_offsets = Vec::with_capacity(260_000);
+    let mut doc_text_lens = Vec::with_capacity(260_000);
+    for w in &worker_data {
+        doc_text_offsets.extend_from_slice(&w.doc_text_offsets);
+        doc_text_lens.extend_from_slice(&w.doc_text_lens);
+    }
+    drop(worker_data);
 
     // Phase 3: Parallel query execution
     let num_queries = parsed_queries.len();
@@ -354,13 +509,22 @@ fn main() -> std::io::Result<()> {
     let chunk_size = (num_queries + num_threads - 1) / num_threads;
     let mut thread_outputs: Vec<Vec<u8>> = (0..num_threads).map(|_| Vec::new()).collect();
 
+    let offsets_ref = &offsets;
+    let postings_ref = &all_postings;
+
     thread::scope(|s| {
-        let index_ref = &index;
         let queries_ref = &parsed_queries;
         let docs_file_ref = &docs_file;
         let doc_text_offsets_ref = &doc_text_offsets;
         let doc_text_lens_ref = &doc_text_lens;
         let vocab_ref = &vocab;
+
+        let get_postings = |tid: u32| -> &[u32] {
+            let t = tid as usize;
+            let start = offsets_ref[t] as usize;
+            let end = offsets_ref[t + 1] as usize;
+            &postings_ref[start..end]
+        };
 
         for (thread_idx, out_buf) in thread_outputs.iter_mut().enumerate() {
             let start = thread_idx * chunk_size;
@@ -381,12 +545,12 @@ fn main() -> std::io::Result<()> {
                         ParsedQuery::Bool { first_term, ops } => {
                             cur_res.clear();
                             if let Some(fid) = *first_term {
-                                cur_res.extend_from_slice(&index_ref[fid as usize]);
+                                cur_res.extend_from_slice(get_postings(fid));
                             }
 
                             for &(op, opt_tid) in ops {
                                 let postings: &[u32] = match opt_tid {
-                                    Some(tid) => &index_ref[tid as usize],
+                                    Some(tid) => get_postings(tid),
                                     None => &[],
                                 };
 
@@ -407,43 +571,43 @@ fn main() -> std::io::Result<()> {
                                 }
                             }
 
-                            let _ = write_results(out_buf, &cur_res);
+                            fast_write_results(out_buf, &cur_res);
                         }
                         ParsedQuery::Phrase { term_ids } => {
                             if term_ids.is_empty() {
-                                let _ = writeln!(out_buf, "0 0");
+                                out_buf.extend_from_slice(b"0 0\n");
                                 continue;
                             }
 
                             // Check if any term is absent
                             let mut any_empty = false;
                             for &tid in term_ids {
-                                if index_ref[tid as usize].is_empty() {
+                                if get_postings(tid).is_empty() {
                                     any_empty = true;
                                     break;
                                 }
                             }
                             if any_empty {
-                                let _ = writeln!(out_buf, "0 0");
+                                out_buf.extend_from_slice(b"0 0\n");
                                 continue;
                             }
 
                             // Order term checks by posting length ascending
                             let mut order: Vec<usize> = (0..term_ids.len()).collect();
                             order.sort_unstable_by_key(|&idx| {
-                                index_ref[term_ids[idx] as usize].len()
+                                get_postings(term_ids[idx]).len()
                             });
 
                             cur_res.clear();
                             let rarest_tid = term_ids[order[0]];
-                            cur_res.extend_from_slice(&index_ref[rarest_tid as usize]);
+                            cur_res.extend_from_slice(get_postings(rarest_tid));
 
                             for &idx in &order[1..] {
                                 if cur_res.is_empty() {
                                     break;
                                 }
                                 let tid = term_ids[idx];
-                                intersect_sorted(&cur_res, &index_ref[tid as usize], &mut scratch);
+                                intersect_sorted(&cur_res, get_postings(tid), &mut scratch);
                                 std::mem::swap(&mut cur_res, &mut scratch);
                             }
 
@@ -494,10 +658,10 @@ fn main() -> std::io::Result<()> {
                                 }
                             }
 
-                            let _ = write_results(out_buf, &matches);
+                            fast_write_results(out_buf, &matches);
                         }
                         ParsedQuery::Empty => {
-                            let _ = writeln!(out_buf, "0 0");
+                            out_buf.extend_from_slice(b"0 0\n");
                         }
                     }
                 }
@@ -515,5 +679,6 @@ fn main() -> std::io::Result<()> {
     }
 
     writer.flush()?;
+
     Ok(())
 }
