@@ -92,6 +92,7 @@ fn load_regions(path: &Path) -> std::io::Result<HashMap<u32, String>> {
     Ok(map)
 }
 
+#[allow(unused_assignments)]
 fn main() -> std::io::Result<()> {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
     let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "/out".to_string());
@@ -133,7 +134,9 @@ fn main() -> std::io::Result<()> {
                         fields[0].drain(0..3);
                     }
 
-                    if !is_header {
+                    if is_header {
+                        is_header = false;
+                    } else {
                         let id_str = std::str::from_utf8(&fields[0]).unwrap();
                         let name_str = std::str::from_utf8(&fields[1]).unwrap().to_string();
                         let note_bytes_len = fields[2].len();
@@ -147,8 +150,6 @@ fn main() -> std::io::Result<()> {
                         let country_key = regions.get(&reg_id).unwrap_or(&unmatched);
                         let country = countries.entry(country_key.clone()).or_insert_with(Country::new);
                         country.add(id, name_str, note_bytes_len, cents);
-                    } else {
-                        is_header = false;
                     }
                 }
                 fields.clear();
