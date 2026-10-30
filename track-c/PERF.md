@@ -6,3 +6,4 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | (official baseline) | 14.44 | 367 | 0 |
 | 1 | Safe Rust baseline (streaming RFC 4180 CSV state machine, exact integer cents, zero crates) | (local 0.40s sample vs 0.96s ref) | pending | pending | pending |
+| 2 | Direct region array lookup, integer name pool interning, zero-alloc note length | (local 0.31s sample vs 0.96s ref) | pending | pending | pending |
