@@ -1,34 +1,8 @@
-use std::collections::HashSet;
 use std::fs::{self, File};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::thread;
-
-#[derive(Default)]
-struct FastHasher(u64);
-
-impl Hasher for FastHasher {
-    #[inline(always)]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline(always)]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = self.0.wrapping_add(0x517cc1b727220a95);
-        for &b in bytes {
-            hash = hash.rotate_left(5) ^ (b as u64);
-            hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
-        }
-        self.0 = hash;
-    }
-    #[inline(always)]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = (self.0 ^ i).wrapping_mul(0x9e3779b97f4a7c15);
-    }
-}
-type FastBuildHasher = BuildHasherDefault<FastHasher>;
 
 #[inline(always)]
 fn hash_init() -> u64 {
@@ -40,6 +14,7 @@ fn hash_byte(h: u64, b: u8) -> u64 {
     (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x9e3779b97f4a7c15)
 }
 
+#[derive(Clone, Copy)]
 struct LocalAgg {
     count: u64,
     id_sum: i64,
@@ -48,7 +23,6 @@ struct LocalAgg {
     amount_max: i64,
     name_bytes: usize,
     note_bytes: usize,
-    names: HashSet<u64, FastBuildHasher>,
 }
 
 impl LocalAgg {
@@ -61,9 +35,13 @@ impl LocalAgg {
             amount_max: i64::MIN,
             name_bytes: 0,
             note_bytes: 0,
-            names: HashSet::with_hasher(FastBuildHasher::default()),
         }
     }
+}
+
+struct WorkerOutput {
+    aggs: Vec<LocalAgg>,
+    names: Vec<Vec<u64>>,
 }
 
 fn format_cents(cents: i64) -> String {
@@ -210,7 +188,8 @@ fn main() -> std::io::Result<()> {
         let handle = thread::spawn(move || {
             let t_file = File::open(&path).unwrap();
             let mut buf = vec![0u8; CHUNK_SIZE + 8192];
-            let mut aggs: Vec<LocalAgg> = (0..num_countries).map(|_| LocalAgg::new()).collect();
+            let mut aggs: Vec<LocalAgg> = vec![LocalAgg::new(); num_countries];
+            let mut names: Vec<Vec<u64>> = (0..num_countries).map(|_| Vec::new()).collect();
 
             let mut cur_offset = start_pos;
             let mut rem_len = 0;
@@ -381,7 +360,7 @@ fn main() -> std::io::Result<()> {
                     }
                     agg.name_bytes += name_len;
                     agg.note_bytes += note_len;
-                    agg.names.insert(name_hash);
+                    names[c_id].push(name_hash);
                 }
 
                 rem_len = total_available - valid_len;
@@ -390,32 +369,73 @@ fn main() -> std::io::Result<()> {
                 }
             }
 
-            aggs
+            WorkerOutput { aggs, names }
         });
         handles.push(handle);
     }
 
-    let mut all_aggs = (0..num_countries).map(|_| LocalAgg::new()).collect::<Vec<_>>();
-    for h in handles {
-        let worker_aggs = h.join().unwrap();
-        for (c_id, w) in worker_aggs.into_iter().enumerate() {
+    let workers: Vec<WorkerOutput> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let mut all_aggs = vec![LocalAgg::new(); num_countries];
+    for w in &workers {
+        for (c_id, agg_w) in w.aggs.iter().enumerate() {
             let agg = &mut all_aggs[c_id];
-            agg.count += w.count;
-            agg.id_sum += w.id_sum;
-            agg.amount_sum += w.amount_sum;
-            if w.amount_min < agg.amount_min {
-                agg.amount_min = w.amount_min;
+            agg.count += agg_w.count;
+            agg.id_sum += agg_w.id_sum;
+            agg.amount_sum += agg_w.amount_sum;
+            if agg_w.amount_min < agg.amount_min {
+                agg.amount_min = agg_w.amount_min;
             }
-            if w.amount_max > agg.amount_max {
-                agg.amount_max = w.amount_max;
+            if agg_w.amount_max > agg.amount_max {
+                agg.amount_max = agg_w.amount_max;
             }
-            agg.name_bytes += w.name_bytes;
-            agg.note_bytes += w.note_bytes;
-            for name_hash in w.names {
-                agg.names.insert(name_hash);
-            }
+            agg.name_bytes += agg_w.name_bytes;
+            agg.note_bytes += agg_w.note_bytes;
         }
     }
+
+    // Parallel distinct name counting across countries
+    let workers_ref: &'static [WorkerOutput] = Box::leak(workers.into_boxed_slice());
+    let mut distinct_counts = vec![0usize; num_countries];
+    let countries_per_worker = (num_countries + NUM_WORKERS - 1) / NUM_WORKERS;
+
+    thread::scope(|s| {
+        let mut handles = Vec::with_capacity(NUM_WORKERS);
+        for t in 0..NUM_WORKERS {
+            let start_c = t * countries_per_worker;
+            let end_c = (start_c + countries_per_worker).min(num_countries);
+            if start_c >= end_c {
+                continue;
+            }
+
+            handles.push(s.spawn(move || {
+                let mut results = Vec::with_capacity(end_c - start_c);
+                let mut combined = Vec::new();
+                for c_id in start_c..end_c {
+                    let total_cap: usize = workers_ref.iter().map(|w| w.names[c_id].len()).sum();
+                    if total_cap == 0 {
+                        results.push((c_id, 0));
+                        continue;
+                    }
+                    combined.clear();
+                    combined.reserve(total_cap);
+                    for w in workers_ref {
+                        combined.extend_from_slice(&w.names[c_id]);
+                    }
+                    combined.sort_unstable();
+                    combined.dedup();
+                    results.push((c_id, combined.len()));
+                }
+                results
+            }));
+        }
+
+        for h in handles {
+            for (c_id, cnt) in h.join().unwrap() {
+                distinct_counts[c_id] = cnt;
+            }
+        }
+    });
 
     // Sort by country name ascending
     let mut sorted_indices: Vec<usize> = (0..num_countries).collect();
@@ -440,7 +460,7 @@ fn main() -> std::io::Result<()> {
             format_cents(agg.amount_sum),
             format_cents(agg.amount_min),
             format_cents(agg.amount_max),
-            agg.names.len(),
+            distinct_counts[c_id],
             agg.name_bytes,
             agg.note_bytes
         )?;
