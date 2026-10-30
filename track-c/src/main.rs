@@ -1,7 +1,32 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0.wrapping_add(0x517cc1b727220a95);
+        for &b in bytes {
+            hash = hash.rotate_left(5) ^ (b as u64);
+            hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
+        }
+        self.0 = hash;
+    }
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x9e3779b97f4a7c15);
+    }
+}
+type FastBuildHasher = BuildHasherDefault<FastHasher>;
 
 struct CountryAgg {
     count: u64,
@@ -11,7 +36,7 @@ struct CountryAgg {
     amount_max: i64,
     name_bytes: usize,
     note_bytes: usize,
-    names: HashSet<u32>,
+    names: HashSet<u32, FastBuildHasher>,
 }
 
 impl CountryAgg {
@@ -24,7 +49,7 @@ impl CountryAgg {
             amount_max: i64::MIN,
             name_bytes: 0,
             note_bytes: 0,
-            names: HashSet::new(),
+            names: HashSet::with_hasher(FastBuildHasher::default()),
         }
     }
 
@@ -154,7 +179,8 @@ fn main() -> std::io::Result<()> {
 
     let num_countries = country_names.len();
     let mut aggregates: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::new()).collect();
-    let mut name_pool: HashMap<Box<[u8]>, u32> = HashMap::with_capacity(100_000);
+    let mut name_pool: HashMap<Box<[u8]>, u32, FastBuildHasher> =
+        HashMap::with_capacity_and_hasher(100_000, FastBuildHasher::default());
 
     let records_file = File::open(&records_path)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, records_file);

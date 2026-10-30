@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::thread;
 
@@ -22,6 +23,15 @@ impl Hasher for FastHasher {
         }
         self.0 = hash;
     }
+}
+#[inline(always)]
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0x517cc1b727220a95u64;
+    for &b in bytes {
+        hash = hash.rotate_left(5) ^ (b as u64);
+        hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
+    }
+    hash
 }
 type FastBuildHasher = BuildHasherDefault<FastHasher>;
 
@@ -132,6 +142,7 @@ fn main() -> std::io::Result<()> {
     let mut vocab: HashMap<Box<[u8]>, u32, FastBuildHasher> =
         HashMap::with_capacity_and_hasher(32768, FastBuildHasher::default());
     let mut raw_queries = Vec::with_capacity(50000);
+    let mut bloom = vec![0u64; 8192];
 
     for line_res in queries_reader.lines() {
         let line = line_res?;
@@ -146,6 +157,11 @@ fn main() -> std::io::Result<()> {
                 if !vocab.contains_key(term) {
                     let id = vocab.len() as u32;
                     vocab.insert(term.into(), id);
+                    let h = hash_bytes(term);
+                    let b1 = (h & 0x7FFFF) as usize;
+                    let b2 = ((h >> 20) & 0x7FFFF) as usize;
+                    bloom[b1 >> 6] |= 1u64 << (b1 & 63);
+                    bloom[b2 >> 6] |= 1u64 << (b2 & 63);
                 }
             }
         } else if let Some(rest) = line.strip_prefix("PHRASE \"") {
@@ -155,6 +171,11 @@ fn main() -> std::io::Result<()> {
                 if !vocab.contains_key(term) {
                     let id = vocab.len() as u32;
                     vocab.insert(term.into(), id);
+                    let h = hash_bytes(term);
+                    let b1 = (h & 0x7FFFF) as usize;
+                    let b2 = ((h >> 20) & 0x7FFFF) as usize;
+                    bloom[b1 >> 6] |= 1u64 << (b1 & 63);
+                    bloom[b2 >> 6] |= 1u64 << (b2 & 63);
                 }
             }
         }
@@ -206,73 +227,128 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Phase 2: Index documents (flat vector of postings lists)
+    // Phase 2: Index documents using streaming chunks
     let vocab_size = vocab.len();
     let mut index: Vec<Vec<u32>> = (0..vocab_size).map(|_| Vec::new()).collect();
     let mut last_seen_doc = vec![u32::MAX; vocab_size];
-    let mut doc_tokens: Vec<Vec<u32>> = Vec::with_capacity(30000);
+
+    let mut doc_text_offsets: Vec<u64> = Vec::with_capacity(260_000);
+    let mut doc_text_lens: Vec<u32> = Vec::with_capacity(260_000);
 
     let docs_file = File::open(&docs_path)?;
-    let mut docs_reader = BufReader::with_capacity(1024 * 1024, docs_file);
-
-    let mut line_buf = Vec::with_capacity(4096);
+    let mut chunk_buf = vec![0u8; 4 * 1024 * 1024];
+    let mut remainder = Vec::new();
+    let mut reader = BufReader::with_capacity(1024 * 1024, &docs_file);
+    let mut current_file_offset = 0u64;
     let mut doc_id = 0u32;
 
-    while docs_reader.read_until(b'\n', &mut line_buf)? > 0 {
-        let tab_pos = line_buf.iter().position(|&b| b == b'\t').unwrap_or(line_buf.len());
-        let text = if tab_pos < line_buf.len() {
-            &line_buf[tab_pos + 1..]
+    loop {
+        let rem_len = remainder.len();
+        if rem_len > 0 {
+            chunk_buf[..rem_len].copy_from_slice(&remainder);
+            remainder.clear();
+        }
+        let n = reader.read(&mut chunk_buf[rem_len..])?;
+        if n == 0 && rem_len == 0 {
+            break;
+        }
+        let total_len = rem_len + n;
+        let mut last_nl = total_len;
+        while last_nl > 0 && chunk_buf[last_nl - 1] != b'\n' {
+            last_nl -= 1;
+        }
+
+        let valid_len = if n == 0 {
+            total_len
+        } else if last_nl > 0 {
+            remainder.extend_from_slice(&chunk_buf[last_nl..total_len]);
+            last_nl
         } else {
-            &[]
+            remainder.extend_from_slice(&chunk_buf[..total_len]);
+            current_file_offset += total_len as u64;
+            continue;
         };
 
-        // Tokenize document text
-        let mut tokens = Vec::with_capacity(128);
-        let len = text.len();
-        let mut i = 0;
-        while i < len {
-            let b = text[i];
-            if b.is_ascii_alphanumeric() {
-                let start = i;
-                while i < len && text[i].is_ascii_alphanumeric() {
-                    i += 1;
-                }
-                let slice = &text[start..i];
-                let mut lower = [0u8; 32];
-                let tok_len = slice.len().min(32);
-                for k in 0..tok_len {
-                    lower[k] = slice[k].to_ascii_lowercase();
-                }
-                let key = &lower[..tok_len];
-
-                let tid = match vocab.get(key) {
-                    Some(&id) => {
-                        let id_usize = id as usize;
-                        if last_seen_doc[id_usize] != doc_id {
-                            last_seen_doc[id_usize] = doc_id;
-                            index[id_usize].push(doc_id);
-                        }
-                        id
-                    }
-                    None => u32::MAX, // Non-query term
-                };
-                tokens.push(tid);
+        let slice = &chunk_buf[..valid_len];
+        let mut p = 0;
+        while p < valid_len {
+            // Scan doc_id up to TAB
+            while p < valid_len && slice[p] != b'\t' && slice[p] != b'\n' {
+                p += 1;
+            }
+            if p >= valid_len {
+                break;
+            }
+            let text_start = if slice[p] == b'\t' {
+                p += 1;
+                p
             } else {
-                i += 1;
+                p
+            };
+
+            let text_file_offset = current_file_offset + text_start as u64;
+
+            // Tokenize document text until '\n'
+            while p < valid_len && slice[p] != b'\n' {
+                let b = slice[p];
+                if b.is_ascii_alphanumeric() {
+                    let start = p;
+                    let mut hash = 0x517cc1b727220a95u64;
+                    let mut count = 0;
+                    while p < valid_len && slice[p].is_ascii_alphanumeric() {
+                        if count < 32 {
+                            let lb = slice[p].to_ascii_lowercase();
+                            hash = hash.rotate_left(5) ^ (lb as u64);
+                            hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
+                            count += 1;
+                        }
+                        p += 1;
+                    }
+
+                    let b1 = (hash & 0x7FFFF) as usize;
+                    let b2 = ((hash >> 20) & 0x7FFFF) as usize;
+                    let in_bloom = ((bloom[b1 >> 6] >> (b1 & 63)) & 1) != 0
+                                && ((bloom[b2 >> 6] >> (b2 & 63)) & 1) != 0;
+
+                    if in_bloom {
+                        let mut lower = [0u8; 32];
+                        for k in 0..count {
+                            lower[k] = slice[start + k].to_ascii_lowercase();
+                        }
+                        let key = &lower[..count];
+                        if let Some(&id) = vocab.get(key) {
+                            let id_usize = id as usize;
+                            if last_seen_doc[id_usize] != doc_id {
+                                last_seen_doc[id_usize] = doc_id;
+                                index[id_usize].push(doc_id);
+                            }
+                        }
+                    }
+                } else {
+                    p += 1;
+                }
+            }
+
+            let text_end = p;
+            let text_len = (text_end - text_start) as u32;
+            doc_text_offsets.push(text_file_offset);
+            doc_text_lens.push(text_len);
+            doc_id += 1;
+
+            if p < valid_len && slice[p] == b'\n' {
+                p += 1;
             }
         }
 
-        doc_tokens.push(tokens);
-        doc_id += 1;
-        line_buf.clear();
+        current_file_offset += valid_len as u64;
     }
 
     // Phase 3: Parallel query execution
     let num_queries = parsed_queries.len();
     let num_threads = thread::available_parallelism()
         .map(|p| p.get())
-        .unwrap_or(8)
-        .min(8)
+        .unwrap_or(12)
+        .min(12)
         .max(1);
 
     let chunk_size = (num_queries + num_threads - 1) / num_threads;
@@ -280,8 +356,11 @@ fn main() -> std::io::Result<()> {
 
     thread::scope(|s| {
         let index_ref = &index;
-        let doc_tokens_ref = &doc_tokens;
         let queries_ref = &parsed_queries;
+        let docs_file_ref = &docs_file;
+        let doc_text_offsets_ref = &doc_text_offsets;
+        let doc_text_lens_ref = &doc_text_lens;
+        let vocab_ref = &vocab;
 
         for (thread_idx, out_buf) in thread_outputs.iter_mut().enumerate() {
             let start = thread_idx * chunk_size;
@@ -294,6 +373,8 @@ fn main() -> std::io::Result<()> {
                 let mut cur_res = Vec::new();
                 let mut next_res = Vec::new();
                 let mut scratch = Vec::new();
+                let mut doc_buf = vec![0u8; 8192];
+                let mut doc_tokens = Vec::with_capacity(256);
 
                 for q_idx in start..end {
                     match &queries_ref[q_idx] {
@@ -366,12 +447,49 @@ fn main() -> std::io::Result<()> {
                                 std::mem::swap(&mut cur_res, &mut scratch);
                             }
 
-                            // Verify consecutive positions
+                            // Verify consecutive positions on candidate docs
                             let k = term_ids.len();
                             let mut matches = Vec::new();
                             for &c_doc in &cur_res {
-                                let d_tokens = &doc_tokens_ref[c_doc as usize];
-                                if d_tokens.windows(k).any(|w| w == term_ids.as_slice()) {
+                                let f_offset = doc_text_offsets_ref[c_doc as usize];
+                                let t_len = doc_text_lens_ref[c_doc as usize] as usize;
+                                if t_len == 0 {
+                                    continue;
+                                }
+                                if t_len > doc_buf.len() {
+                                    doc_buf.resize(t_len, 0);
+                                }
+                                if docs_file_ref.read_exact_at(&mut doc_buf[..t_len], f_offset).is_err() {
+                                    continue;
+                                }
+
+                                doc_tokens.clear();
+                                let d_slice = &doc_buf[..t_len];
+                                let mut dp = 0;
+                                while dp < t_len {
+                                    if d_slice[dp].is_ascii_alphanumeric() {
+                                        let t_start = dp;
+                                        let mut count = 0;
+                                        while dp < t_len && d_slice[dp].is_ascii_alphanumeric() {
+                                            count += 1;
+                                            dp += 1;
+                                        }
+                                        let mut lower = [0u8; 32];
+                                        let c = count.min(32);
+                                        for k_idx in 0..c {
+                                            lower[k_idx] = d_slice[t_start + k_idx].to_ascii_lowercase();
+                                        }
+                                        let tid = match vocab_ref.get(&lower[..c]) {
+                                            Some(&id) => id,
+                                            None => u32::MAX,
+                                        };
+                                        doc_tokens.push(tid);
+                                    } else {
+                                        dp += 1;
+                                    }
+                                }
+
+                                if doc_tokens.windows(k).any(|w| w == term_ids.as_slice()) {
                                     matches.push(c_doc);
                                 }
                             }
