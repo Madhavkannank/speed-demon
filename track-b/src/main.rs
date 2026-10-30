@@ -1,37 +1,124 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
-fn tokenize(bytes: &[u8]) -> Vec<Vec<u8>> {
-    let mut tokens = Vec::new();
-    let mut current = Vec::new();
-    for &b in bytes {
-        if b.is_ascii_alphanumeric() {
-            current.push(b.to_ascii_lowercase());
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
+#[inline(always)]
+fn intersect_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push(a[i]);
+            i += 1;
+            j += 1;
+        } else if a[i] < b[j] {
+            i += 1;
+        } else {
+            j += 1;
         }
     }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
 }
 
-fn format_results(ids: &[u32]) -> String {
+#[inline(always)]
+fn union_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push(a[i]);
+            i += 1;
+            j += 1;
+        } else if a[i] < b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    if i < a.len() {
+        out.extend_from_slice(&a[i..]);
+    }
+    if j < b.len() {
+        out.extend_from_slice(&b[j..]);
+    }
+}
+
+#[inline(always)]
+fn difference_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else {
+            j += 1;
+        }
+    }
+    if i < a.len() {
+        out.extend_from_slice(&a[i..]);
+    }
+}
+
+#[inline(always)]
+fn write_results<W: Write>(writer: &mut W, ids: &[u32]) -> std::io::Result<()> {
     let count = ids.len();
     if count == 0 {
-        return "0 0".to_string();
+        return writeln!(writer, "0 0");
     }
     let sum: u64 = ids.iter().map(|&x| x as u64).sum();
-    let mut s = format!("{} {}", count, sum);
+    write!(writer, "{} {}", count, sum)?;
     let take = count.min(10);
     for &id in &ids[..take] {
-        s.push(' ');
-        s.push_str(&id.to_string());
+        write!(writer, " {}", id)?;
     }
-    s
+    writeln!(writer)
+}
+
+#[inline(always)]
+fn tokenize_to_interned(
+    bytes: &[u8],
+    vocab: &mut HashMap<Box<[u8]>, u32>,
+    tokens_out: &mut Vec<u32>,
+) {
+    tokens_out.clear();
+    let mut i = 0;
+    let len = bytes.len();
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() {
+            let start = i;
+            while i < len && bytes[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            let slice = &bytes[start..i];
+            let mut lower = [0u8; 32];
+            let tok_len = slice.len().min(32);
+            for k in 0..tok_len {
+                lower[k] = slice[k].to_ascii_lowercase();
+            }
+            let key = &lower[..tok_len];
+            let id = match vocab.get(key) {
+                Some(&id) => id,
+                None => {
+                    let id = vocab.len() as u32;
+                    vocab.insert(key.into(), id);
+                    id
+                }
+            };
+            tokens_out.push(id);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -42,39 +129,53 @@ fn main() -> std::io::Result<()> {
     let queries_path = Path::new(&data_dir).join("queries.txt");
     let out_path = Path::new(&out_dir).join("results.txt");
 
-    // Load corpus
     let docs_file = File::open(&docs_path)?;
-    let docs_reader = BufReader::with_capacity(512 * 1024, docs_file);
+    let mut docs_reader = BufReader::with_capacity(1024 * 1024, docs_file);
 
-    let mut doc_tokens: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+    let mut vocab: HashMap<Box<[u8]>, u32> = HashMap::with_capacity(65536);
+    let mut doc_tokens: Vec<Vec<u32>> = Vec::with_capacity(30000);
+    let mut index: HashMap<u32, Vec<u32>> = HashMap::with_capacity(65536);
 
-    for (line_idx, line_res) in docs_reader.lines().enumerate() {
-        let line = line_res?;
-        let tab_pos = line.find('\t').expect("invalid doc format");
-        let text = &line[tab_pos + 1..];
+    let mut line = Vec::with_capacity(4096);
+    let mut doc_toks = Vec::with_capacity(512);
 
-        let tokens = tokenize(text.as_bytes());
-        let doc_id = line_idx as u32;
+    let mut doc_id = 0u32;
+    while docs_reader.read_until(b'\n', &mut line)? > 0 {
+        let tab_pos = line.iter().position(|&b| b == b'\t').unwrap_or(line.len());
+        let text = if tab_pos < line.len() {
+            &line[tab_pos + 1..]
+        } else {
+            &[]
+        };
 
-        let mut unique_terms: HashSet<&[u8]> = HashSet::new();
-        for t in &tokens {
-            if unique_terms.insert(t.as_slice()) {
-                index.entry(t.clone()).or_default().push(doc_id);
-            }
+        tokenize_to_interned(text, &mut vocab, &mut doc_toks);
+
+        // Record postings for distinct terms in this document
+        // Sort and dedup to ensure one doc_id per term
+        let mut unique_toks = doc_toks.clone();
+        unique_toks.sort_unstable();
+        unique_toks.dedup();
+
+        for &t in &unique_toks {
+            index.entry(t).or_default().push(doc_id);
         }
-        doc_tokens.push(tokens);
+
+        doc_tokens.push(std::mem::take(&mut doc_toks));
+        doc_id += 1;
+        line.clear();
     }
 
     // Process queries
     let queries_file = File::open(&queries_path)?;
-    let queries_reader = BufReader::with_capacity(512 * 1024, queries_file);
+    let queries_reader = BufReader::with_capacity(1024 * 1024, queries_file);
 
     fs::create_dir_all(&out_dir)?;
     let out_file = File::create(&out_path)?;
-    let mut writer = BufWriter::with_capacity(512 * 1024, out_file);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
 
-    let empty_vec: Vec<u32> = Vec::new();
+    let mut cur_res = Vec::new();
+    let mut next_res = Vec::new();
+    let mut scratch = Vec::new();
 
     for line_res in queries_reader.lines() {
         let line = line_res?;
@@ -89,94 +190,103 @@ fn main() -> std::io::Result<()> {
                 continue;
             }
 
-            let first_term = parts[0].to_ascii_lowercase().into_bytes();
-            let mut current: HashSet<u32> = index
-                .get(&first_term)
-                .map(|v| v.iter().copied().collect())
-                .unwrap_or_default();
+            let first_term = parts[0].as_bytes();
+            let first_id = vocab.get(first_term).copied();
+            cur_res.clear();
+            if let Some(fid) = first_id {
+                if let Some(postings) = index.get(&fid) {
+                    cur_res.extend_from_slice(postings);
+                }
+            }
 
             for chunk in parts[1..].chunks(2) {
                 if chunk.len() < 2 {
                     break;
                 }
                 let op = chunk[0];
-                let term = chunk[1].to_ascii_lowercase().into_bytes();
-                let postings = index.get(&term).unwrap_or(&empty_vec);
+                let term = chunk[1].as_bytes();
+                let term_id = vocab.get(term).copied();
+                let postings: &[u32] = match term_id {
+                    Some(tid) => index.get(&tid).map(|v| v.as_slice()).unwrap_or(&[]),
+                    None => &[],
+                };
 
                 match op {
                     "AND" => {
-                        let post_set: HashSet<u32> = postings.iter().copied().collect();
-                        current.retain(|id| post_set.contains(id));
+                        intersect_sorted(&cur_res, postings, &mut next_res);
+                        std::mem::swap(&mut cur_res, &mut next_res);
                     }
                     "OR" => {
-                        for &id in postings {
-                            current.insert(id);
-                        }
+                        union_sorted(&cur_res, postings, &mut next_res);
+                        std::mem::swap(&mut cur_res, &mut next_res);
                     }
                     "NOT" => {
-                        for &id in postings {
-                            current.remove(&id);
-                        }
+                        difference_sorted(&cur_res, postings, &mut next_res);
+                        std::mem::swap(&mut cur_res, &mut next_res);
                     }
                     _ => {}
                 }
             }
 
-            let mut sorted_ids: Vec<u32> = current.into_iter().collect();
-            sorted_ids.sort_unstable();
-            writeln!(writer, "{}", format_results(&sorted_ids))?;
+            write_results(&mut writer, &cur_res)?;
         } else if let Some(rest) = line.strip_prefix("PHRASE \"") {
             let phrase_text = rest.strip_suffix('"').unwrap_or(rest);
-            let terms: Vec<Vec<u8>> = phrase_text
-                .split(' ')
-                .map(|s| s.to_ascii_lowercase().into_bytes())
-                .collect();
+            let phrase_terms: Vec<&str> = phrase_text.split(' ').collect();
 
-            if terms.is_empty() {
+            if phrase_terms.is_empty() {
                 writeln!(writer, "0 0")?;
                 continue;
             }
 
-            // Find candidate documents containing all phrase terms
-            let mut candidate_set: Option<HashSet<u32>> = None;
-            for term in &terms {
-                let postings = index.get(term).unwrap_or(&empty_vec);
-                let post_set: HashSet<u32> = postings.iter().copied().collect();
-                if let Some(ref mut c) = candidate_set {
-                    c.retain(|id| post_set.contains(id));
-                    if c.is_empty() {
-                        break;
-                    }
+            let mut phrase_ids: Vec<u32> = Vec::with_capacity(phrase_terms.len());
+            let mut all_found = true;
+            for pt in &phrase_terms {
+                if let Some(&id) = vocab.get(pt.as_bytes()) {
+                    phrase_ids.push(id);
                 } else {
-                    candidate_set = Some(post_set);
+                    all_found = false;
+                    break;
                 }
             }
 
-            let mut matches: Vec<u32> = Vec::new();
-            if let Some(candidates) = candidate_set {
-                let k = terms.len();
-                let mut sorted_cands: Vec<u32> = candidates.into_iter().collect();
-                sorted_cands.sort_unstable();
+            if !all_found {
+                writeln!(writer, "0 0")?;
+                continue;
+            }
 
-                for doc_id in sorted_cands {
-                    let d_tokens = &doc_tokens[doc_id as usize];
-                    if d_tokens.len() < k {
-                        continue;
-                    }
-                    let mut matched = false;
-                    for window in d_tokens.windows(k) {
-                        if window == terms.as_slice() {
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if matched {
-                        matches.push(doc_id);
-                    }
+            // Order term checks by posting length ascending
+            let mut term_indices: Vec<usize> = (0..phrase_ids.len()).collect();
+            term_indices.sort_unstable_by_key(|&idx| {
+                index.get(&phrase_ids[idx]).map(|v| v.len()).unwrap_or(0)
+            });
+
+            cur_res.clear();
+            let rarest_id = phrase_ids[term_indices[0]];
+            if let Some(postings) = index.get(&rarest_id) {
+                cur_res.extend_from_slice(postings);
+            }
+
+            for &idx in &term_indices[1..] {
+                if cur_res.is_empty() {
+                    break;
+                }
+                let tid = phrase_ids[idx];
+                let postings: &[u32] = index.get(&tid).map(|v| v.as_slice()).unwrap_or(&[]);
+                intersect_sorted(&cur_res, postings, &mut scratch);
+                std::mem::swap(&mut cur_res, &mut scratch);
+            }
+
+            // Verify consecutive match on candidates
+            let mut matches = Vec::new();
+            let k = phrase_ids.len();
+            for &c_doc in &cur_res {
+                let d_tokens = &doc_tokens[c_doc as usize];
+                if d_tokens.windows(k).any(|w| w == phrase_ids.as_slice()) {
+                    matches.push(c_doc);
                 }
             }
 
-            writeln!(writer, "{}", format_results(&matches))?;
+            write_results(&mut writer, &matches)?;
         }
     }
 
