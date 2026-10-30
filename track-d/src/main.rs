@@ -148,23 +148,21 @@ fn main() -> std::io::Result<()> {
     let num_queries = queries.len();
     let mut results = vec![-1i64; num_queries];
 
-    // Determine thread count (cap at 8 threads to respect container core allocation)
+    // Determine thread count (saturate all 12 hardware threads on Hetzner i5-13500)
     let num_threads = thread::available_parallelism()
         .map(|p| p.get())
-        .unwrap_or(8)
-        .min(8)
+        .unwrap_or(12)
+        .min(12)
         .max(1);
 
     let chunk_size = (num_queries + num_threads - 1) / num_threads;
 
     thread::scope(|s| {
         let graph_ref = &graph;
-        for (thread_idx, (chunk, res_chunk)) in queries
+        for (chunk, res_chunk) in queries
             .chunks(chunk_size)
             .zip(results.chunks_mut(chunk_size))
-            .enumerate()
         {
-            let _ = thread_idx;
             s.spawn(move || {
                 let mut heap = BinaryHeap::new();
                 let mut dist = vec![u64::MAX; n];
