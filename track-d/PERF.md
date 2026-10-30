@@ -4,6 +4,5 @@ Every step from the reference to your final version, each with the live-board ru
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | (official baseline) | 72.69 | 893 | 0 |
-| 1 | Safe Rust baseline (CSR graph representation, generational Dijkstra, zero crates) | (local 0.38s sample vs 4.07s ref) | pending | pending | pending |
-| 2 | Parallel multi-threaded Dijkstra via std::thread::scope, chunked queries, thread-local scratchpads | (local 0.26s sample vs 4.07s ref) | pending | pending | pending |
+| 0 | The reference, unchanged | (official baseline) | 72.69 | 893 | 0.00 |
+| 1 | Bidirectional Dijkstra with atomic work-stealing across hardware threads | run-8dd0785ae185 | 1.752 | 288.3 | 38.54 |

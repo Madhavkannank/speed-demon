@@ -4,7 +4,6 @@ Every step from the reference to your final version, each with the live-board ru
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | (official baseline) | 14.44 | 367 | 0 |
-| 1 | Safe Rust baseline (streaming RFC 4180 CSV state machine, exact integer cents, zero crates) | (local 0.40s sample vs 0.96s ref) | pending | pending | pending |
-| 2 | Direct region array lookup, integer name pool interning, zero-alloc note length | (local 0.31s sample vs 0.96s ref) | pending | pending | pending |
-| 3 | Zero per-row vector allocations, direct field index dispatch, static reusable field buffers | (local 0.31s sample vs 0.96s ref) | pending | pending | pending |
+| 0 | The reference, unchanged | (official baseline) | 14.44 | 367 | 0.00 |
+| 1 | Safe Rust streaming CSV state machine with exact integer cents | run-012e7bd1d7e0 | 1.533 | 38.8 | 30.49 |
+| 2 | Parallel multi-worker CSV boundary chunking with zero-copy slice parsing and direct region array | local verified (d8088b... match) | 0.190 | 64.9 | 72.3 est |

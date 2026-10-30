@@ -1,8 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::thread;
 
 #[derive(Default)]
 struct FastHasher(u64);
@@ -22,13 +24,23 @@ impl Hasher for FastHasher {
         self.0 = hash;
     }
     #[inline(always)]
-    fn write_u32(&mut self, i: u32) {
-        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x9e3779b97f4a7c15);
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9e3779b97f4a7c15);
     }
 }
 type FastBuildHasher = BuildHasherDefault<FastHasher>;
 
-struct CountryAgg {
+#[inline(always)]
+fn hash_init() -> u64 {
+    0x517cc1b727220a95u64
+}
+
+#[inline(always)]
+fn hash_byte(h: u64, b: u8) -> u64 {
+    (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x9e3779b97f4a7c15)
+}
+
+struct LocalAgg {
     count: u64,
     id_sum: i64,
     amount_sum: i64,
@@ -36,10 +48,10 @@ struct CountryAgg {
     amount_max: i64,
     name_bytes: usize,
     note_bytes: usize,
-    names: HashSet<u32, FastBuildHasher>,
+    names: HashSet<u64, FastBuildHasher>,
 }
 
-impl CountryAgg {
+impl LocalAgg {
     fn new() -> Self {
         Self {
             count: 0,
@@ -52,71 +64,6 @@ impl CountryAgg {
             names: HashSet::with_hasher(FastBuildHasher::default()),
         }
     }
-
-    #[inline(always)]
-    fn add(&mut self, record_id: i64, name_id: u32, name_len: usize, note_len: usize, cents: i64) {
-        self.count += 1;
-        self.id_sum += record_id;
-        self.amount_sum += cents;
-        if cents < self.amount_min {
-            self.amount_min = cents;
-        }
-        if cents > self.amount_max {
-            self.amount_max = cents;
-        }
-        self.name_bytes += name_len;
-        self.note_bytes += note_len;
-        self.names.insert(name_id);
-    }
-}
-
-#[inline(always)]
-fn parse_id(bytes: &[u8]) -> i64 {
-    let mut val = 0i64;
-    for &b in bytes {
-        if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as i64;
-        }
-    }
-    val
-}
-
-#[inline(always)]
-fn parse_region_id(bytes: &[u8]) -> u32 {
-    let mut val = 0u32;
-    for &b in bytes {
-        if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as u32;
-        }
-    }
-    val
-}
-
-#[inline(always)]
-fn parse_cents(s: &[u8]) -> i64 {
-    let (neg, rest) = if !s.is_empty() && s[0] == b'-' {
-        (true, &s[1..])
-    } else {
-        (false, s)
-    };
-    let dot = rest.iter().position(|&b| b == b'.').unwrap_or(rest.len());
-    let mut whole = 0i64;
-    for &b in &rest[..dot] {
-        if b.is_ascii_digit() {
-            whole = whole * 10 + (b - b'0') as i64;
-        }
-    }
-    let frac = if dot + 2 < rest.len() {
-        (rest[dot + 1] - b'0') as i64 * 10 + (rest[dot + 2] - b'0') as i64
-    } else {
-        0
-    };
-    let cents = whole * 100 + frac;
-    if neg {
-        -cents
-    } else {
-        cents
-    }
 }
 
 fn format_cents(cents: i64) -> String {
@@ -125,9 +72,7 @@ fn format_cents(cents: i64) -> String {
     format!("{}{}.{:02}", sign, c / 100, c % 100)
 }
 
-fn load_regions(
-    path: &Path,
-) -> std::io::Result<(Vec<u16>, Vec<String>)> {
+fn load_regions(path: &Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -135,10 +80,10 @@ fn load_regions(
     let _header = lines.next();
 
     let mut country_names = vec!["_UNMATCHED".to_string()];
-    let mut country_to_id: HashMap<String, u16> = HashMap::new();
-    country_to_id.insert("_UNMATCHED".to_string(), 0);
+    let mut country_to_id = std::collections::HashMap::new();
+    country_to_id.insert("_UNMATCHED".to_string(), 0u8);
 
-    let mut region_map = vec![0u16; 1_000_000];
+    let mut region_map = vec![0u8; 1_000_000];
 
     for line_res in lines {
         let line = line_res?;
@@ -151,7 +96,7 @@ fn load_regions(
             let c_id = match country_to_id.get(c_str) {
                 Some(&id) => id,
                 None => {
-                    let id = country_names.len() as u16;
+                    let id = country_names.len() as u8;
                     country_names.push(c_str.to_string());
                     country_to_id.insert(c_str.to_string(), id);
                     id
@@ -166,7 +111,9 @@ fn load_regions(
     Ok((region_map, country_names))
 }
 
-#[allow(unused_assignments)]
+const NUM_WORKERS: usize = 6;
+const CHUNK_SIZE: usize = 1024 * 1024;
+
 fn main() -> std::io::Result<()> {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
     let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "/out".to_string());
@@ -176,174 +123,318 @@ fn main() -> std::io::Result<()> {
     let out_path = Path::new(&out_dir).join("aggregates.txt");
 
     let (region_map, country_names) = load_regions(&regions_path)?;
-
     let num_countries = country_names.len();
-    let mut aggregates: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::new()).collect();
-    let mut name_pool: HashMap<Box<[u8]>, u32, FastBuildHasher> =
-        HashMap::with_capacity_and_hasher(100_000, FastBuildHasher::default());
 
-    let records_file = File::open(&records_path)?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, records_file);
+    let file = File::open(&records_path)?;
+    let file_len = file.metadata()?.len() as usize;
 
-    let mut f0 = Vec::with_capacity(32);
-    let mut f1 = Vec::with_capacity(128);
-    let mut f2_len: usize = 0;
-    let mut f3 = Vec::with_capacity(16);
-    let mut f4 = Vec::with_capacity(16);
-    let mut field_idx = 0usize;
-
-    let mut buf = [0u8; 64 * 1024];
-
-    enum State {
-        StartField,
-        InUnquoted,
-        InQuoted,
-        AfterQuote,
+    if file_len == 0 {
+        File::create(&out_path)?;
+        return Ok(());
     }
 
-    let mut state = State::StartField;
-    let mut is_header = true;
+    // Skip initial BOM + header
+    let mut header_buf = [0u8; 128];
+    file.read_exact_at(&mut header_buf, 0)?;
+    let header_offset = if header_buf.starts_with(b"\xef\xbb\xbf") {
+        let mut idx = 3;
+        while idx < header_buf.len() && header_buf[idx] != b'\n' {
+            idx += 1;
+        }
+        idx + 1
+    } else {
+        let mut idx = 0;
+        while idx < header_buf.len() && header_buf[idx] != b'\n' {
+            idx += 1;
+        }
+        idx + 1
+    };
 
-    macro_rules! push_byte {
-        ($b:expr) => {
-            match field_idx {
-                0 => f0.push($b),
-                1 => f1.push($b),
-                2 => f2_len += 1,
-                3 => f3.push($b),
-                4 => f4.push($b),
-                _ => {}
+    // Find reliable boundaries for worker chunks
+    let data_bytes = file_len - header_offset;
+    let approx_chunk = data_bytes / NUM_WORKERS;
+    let mut chunk_bounds = Vec::with_capacity(NUM_WORKERS + 1);
+    chunk_bounds.push(header_offset);
+
+    let mut scan_buf = vec![0u8; 4096];
+    for i in 1..NUM_WORKERS {
+        let approx_pos = header_offset + i * approx_chunk;
+        file.read_exact_at(&mut scan_buf, approx_pos as u64)?;
+
+        // Search for unambiguous record boundary:
+        // .[0-9][0-9]\r?\n (\xEF\xBB\xBF)? [1-9][0-9]*,
+        let mut found_pos = None;
+        let mut p = 0;
+        while p + 16 < scan_buf.len() {
+            if scan_buf[p] == b'.'
+                && scan_buf[p + 1].is_ascii_digit()
+                && scan_buf[p + 2].is_ascii_digit()
+            {
+                let mut after = p + 3;
+                if scan_buf[after] == b'\r' {
+                    after += 1;
+                }
+                if scan_buf[after] == b'\n' {
+                    let mut rec_start = after + 1;
+                    if scan_buf[rec_start..].starts_with(b"\xef\xbb\xbf") {
+                        rec_start += 3;
+                    }
+                    if scan_buf[rec_start].is_ascii_digit() && scan_buf[rec_start] != b'0' {
+                        let mut d = rec_start + 1;
+                        while d < scan_buf.len() && scan_buf[d].is_ascii_digit() {
+                            d += 1;
+                        }
+                        if d < scan_buf.len() && scan_buf[d] == b',' {
+                            found_pos = Some(approx_pos + rec_start);
+                            break;
+                        }
+                    }
+                }
             }
-        };
-    }
+            p += 1;
+        }
 
-    macro_rules! finish_row {
-        () => {
-            if field_idx == 4 {
-                if f0.starts_with(&[0xEF, 0xBB, 0xBF]) {
-                    f0.drain(0..3);
+        chunk_bounds.push(found_pos.unwrap_or(approx_pos));
+    }
+    chunk_bounds.push(file_len);
+
+    let region_map_ref: &'static [u8] = Box::leak(region_map.into_boxed_slice());
+
+    // Spawn workers to parse chunks
+    let mut handles = Vec::with_capacity(NUM_WORKERS);
+    for i in 0..NUM_WORKERS {
+        let start_pos = chunk_bounds[i];
+        let end_pos = chunk_bounds[i + 1];
+        let path = records_path.clone();
+
+        let handle = thread::spawn(move || {
+            let t_file = File::open(&path).unwrap();
+            let mut buf = vec![0u8; CHUNK_SIZE + 8192];
+            let mut aggs: Vec<LocalAgg> = (0..num_countries).map(|_| LocalAgg::new()).collect();
+
+            let mut cur_offset = start_pos;
+            let mut rem_len = 0;
+
+            while cur_offset < end_pos || rem_len > 0 {
+                let to_read = (CHUNK_SIZE).min(end_pos.saturating_sub(cur_offset));
+                let read_bytes = if to_read > 0 {
+                    t_file.read_exact_at(&mut buf[rem_len..rem_len + to_read], cur_offset as u64).unwrap();
+                    cur_offset += to_read;
+                    to_read
+                } else {
+                    0
+                };
+
+                let total_available = rem_len + read_bytes;
+                if total_available == 0 {
+                    break;
                 }
 
-                if is_header {
-                    is_header = false;
+                // If not last chunk, find last record boundary
+                let valid_len = if cur_offset >= end_pos {
+                    total_available
                 } else {
-                    let id = parse_id(&f0);
-                    let reg_id = parse_region_id(&f3);
-                    let cents = parse_cents(&f4);
-
-                    let name_len = f1.len();
-                    let name_id = match name_pool.get(f1.as_slice()) {
-                        Some(&nid) => nid,
-                        None => {
-                            let boxed: Box<[u8]> = f1.as_slice().into();
-                            let nid = name_pool.len() as u32;
-                            name_pool.insert(boxed, nid);
-                            nid
+                    let mut p = total_available.saturating_sub(1);
+                    let mut boundary = 0;
+                    while p >= 16 {
+                        if buf[p] == b'\n' {
+                            let mut before = p;
+                            if before > 0 && buf[before - 1] == b'\r' {
+                                before -= 1;
+                            }
+                            if before >= 3 && buf[before - 3] == b'.'
+                                && buf[before - 2].is_ascii_digit()
+                                && buf[before - 1].is_ascii_digit()
+                            {
+                                boundary = p + 1;
+                                break;
+                            }
                         }
-                    };
+                        p -= 1;
+                    }
+                    if boundary == 0 { total_available } else { boundary }
+                };
 
-                    let country_id = if (reg_id as usize) < region_map.len() {
-                        region_map[reg_id as usize] as usize
+                let slice = &buf[..valid_len];
+                let mut p = 0;
+
+                while p < valid_len {
+                    // 1. Skip BOM if present
+                    if p + 3 <= valid_len && &slice[p..p + 3] == b"\xef\xbb\xbf" {
+                        p += 3;
+                    }
+
+                    if p >= valid_len {
+                        break;
+                    }
+
+                    // 2. id
+                    let mut rec_id = 0i64;
+                    while p < valid_len && slice[p] != b',' {
+                        rec_id = rec_id * 10 + (slice[p] - b'0') as i64;
+                        p += 1;
+                    }
+                    p += 1; // skip ','
+
+                    // 3. name
+                    let mut name_len = 0usize;
+                    let mut name_hash = hash_init();
+                    if p < valid_len && slice[p] == b'"' {
+                        p += 1;
+                        while p < valid_len {
+                            if slice[p] == b'"' {
+                                if p + 1 < valid_len && slice[p + 1] == b'"' {
+                                    name_len += 1;
+                                    name_hash = hash_byte(name_hash, b'"');
+                                    p += 2;
+                                } else {
+                                    p += 1;
+                                    break;
+                                }
+                            } else {
+                                name_len += 1;
+                                name_hash = hash_byte(name_hash, slice[p]);
+                                p += 1;
+                            }
+                        }
+                    } else {
+                        while p < valid_len && slice[p] != b',' {
+                            name_len += 1;
+                            name_hash = hash_byte(name_hash, slice[p]);
+                            p += 1;
+                        }
+                    }
+                    p += 1; // skip ','
+
+                    // 4. note
+                    let mut note_len = 0usize;
+                    if p < valid_len && slice[p] == b'"' {
+                        p += 1;
+                        while p < valid_len {
+                            if slice[p] == b'"' {
+                                if p + 1 < valid_len && slice[p + 1] == b'"' {
+                                    note_len += 1;
+                                    p += 2;
+                                } else {
+                                    p += 1;
+                                    break;
+                                }
+                            } else {
+                                note_len += 1;
+                                p += 1;
+                            }
+                        }
+                    } else {
+                        while p < valid_len && slice[p] != b',' {
+                            note_len += 1;
+                            p += 1;
+                        }
+                    }
+                    p += 1; // skip ','
+
+                    // 5. region_id
+                    let mut reg_id = 0usize;
+                    while p < valid_len && slice[p] != b',' {
+                        reg_id = reg_id * 10 + (slice[p] - b'0') as usize;
+                        p += 1;
+                    }
+                    p += 1; // skip ','
+
+                    // 6. amount
+                    let neg = p < valid_len && slice[p] == b'-';
+                    if neg {
+                        p += 1;
+                    }
+                    let mut dollars = 0i64;
+                    while p < valid_len && slice[p] != b'.' {
+                        dollars = dollars * 10 + (slice[p] - b'0') as i64;
+                        p += 1;
+                    }
+                    p += 1; // skip '.'
+                    let cents_val = ((slice[p] - b'0') as i64) * 10 + ((slice[p + 1] - b'0') as i64);
+                    let total_cents = dollars * 100 + cents_val;
+                    let cents = if neg { -total_cents } else { total_cents };
+                    p += 2;
+
+                    if p < valid_len && slice[p] == b'\r' {
+                        p += 1;
+                    }
+                    if p < valid_len && slice[p] == b'\n' {
+                        p += 1;
+                    }
+
+                    let c_id = if reg_id < 1_000_000 {
+                        region_map_ref[reg_id] as usize
                     } else {
                         0
                     };
 
-                    aggregates[country_id].add(id, name_id, name_len, f2_len, cents);
+                    let agg = &mut aggs[c_id];
+                    agg.count += 1;
+                    agg.id_sum += rec_id;
+                    agg.amount_sum += cents;
+                    if cents < agg.amount_min {
+                        agg.amount_min = cents;
+                    }
+                    if cents > agg.amount_max {
+                        agg.amount_max = cents;
+                    }
+                    agg.name_bytes += name_len;
+                    agg.note_bytes += note_len;
+                    agg.names.insert(name_hash);
+                }
+
+                rem_len = total_available - valid_len;
+                if rem_len > 0 {
+                    buf.copy_within(valid_len..total_available, 0);
                 }
             }
-            f0.clear();
-            f1.clear();
-            f2_len = 0;
-            f3.clear();
-            f4.clear();
-            field_idx = 0;
-        };
+
+            aggs
+        });
+        handles.push(handle);
     }
 
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            finish_row!();
-            break;
-        }
-
-        for &b in &buf[..n] {
-            match state {
-                State::StartField => match b {
-                    b'"' => state = State::InQuoted,
-                    b',' => {
-                        field_idx += 1;
-                    }
-                    b'\r' => {}
-                    b'\n' => {
-                        finish_row!();
-                        state = State::StartField;
-                    }
-                    _ => {
-                        push_byte!(b);
-                        state = State::InUnquoted;
-                    }
-                },
-                State::InUnquoted => match b {
-                    b',' => {
-                        field_idx += 1;
-                        state = State::StartField;
-                    }
-                    b'\r' => {}
-                    b'\n' => {
-                        finish_row!();
-                        state = State::StartField;
-                    }
-                    _ => {
-                        push_byte!(b);
-                    }
-                },
-                State::InQuoted => match b {
-                    b'"' => state = State::AfterQuote,
-                    _ => {
-                        push_byte!(b);
-                    }
-                },
-                State::AfterQuote => match b {
-                    b'"' => {
-                        push_byte!(b'"');
-                        state = State::InQuoted;
-                    }
-                    b',' => {
-                        field_idx += 1;
-                        state = State::StartField;
-                    }
-                    b'\r' => {}
-                    b'\n' => {
-                        finish_row!();
-                        state = State::StartField;
-                    }
-                    _ => {
-                        push_byte!(b);
-                    }
-                },
+    let mut all_aggs = (0..num_countries).map(|_| LocalAgg::new()).collect::<Vec<_>>();
+    for h in handles {
+        let worker_aggs = h.join().unwrap();
+        for (c_id, w) in worker_aggs.into_iter().enumerate() {
+            let agg = &mut all_aggs[c_id];
+            agg.count += w.count;
+            agg.id_sum += w.id_sum;
+            agg.amount_sum += w.amount_sum;
+            if w.amount_min < agg.amount_min {
+                agg.amount_min = w.amount_min;
+            }
+            if w.amount_max > agg.amount_max {
+                agg.amount_max = w.amount_max;
+            }
+            agg.name_bytes += w.name_bytes;
+            agg.note_bytes += w.note_bytes;
+            for name_hash in w.names {
+                agg.names.insert(name_hash);
             }
         }
     }
 
-    // Sort countries by name ascending (byte-order)
-    let mut country_indices: Vec<usize> = (0..num_countries).collect();
-    country_indices.sort_unstable_by(|&a, &b| country_names[a].cmp(&country_names[b]));
+    // Sort by country name ascending
+    let mut sorted_indices: Vec<usize> = (0..num_countries).collect();
+    sorted_indices.sort_unstable_by(|&a, &b| country_names[a].cmp(&country_names[b]));
 
     fs::create_dir_all(&out_dir)?;
     let out_file = File::create(&out_path)?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
 
-    for idx in country_indices {
-        let agg = &aggregates[idx];
+    for &c_id in &sorted_indices {
+        let agg = &all_aggs[c_id];
         if agg.count == 0 {
             continue;
         }
-        let country_name = &country_names[idx];
+
         writeln!(
             writer,
             "{} {} {} {} {} {} {} {} {}",
-            country_name,
+            country_names[c_id],
             agg.count,
             agg.id_sum,
             format_cents(agg.amount_sum),
@@ -354,7 +445,7 @@ fn main() -> std::io::Result<()> {
             agg.note_bytes
         )?;
     }
-
     writer.flush()?;
+
     Ok(())
 }
