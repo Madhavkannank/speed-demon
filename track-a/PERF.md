@@ -6,3 +6,4 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | (official baseline) | 32.05 | 228 | 0 |
 | 1 | Safe Rust baseline (streaming BufReader, fixed-width hour slicing, zero crates) | (local 0.24s sample vs 2.16s ref) | pending | pending | pending |
+| 2 | Zero-copy byte parsing, 72-hour direct indexing, endpoint interner | (local 0.19s sample vs 2.16s ref) | pending | pending | pending |
