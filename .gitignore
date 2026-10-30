@@ -1,0 +1,4 @@
+# Ignore local clone artifacts in prep repo
+official-materials/
+starter-template/
+.data/
