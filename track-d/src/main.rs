@@ -40,6 +40,7 @@ fn main() -> std::io::Result<()> {
     let queries_path = Path::new(&data_dir).join("queries.txt");
     let out_path = Path::new(&out_dir).join("distances.txt");
 
+
     let bytes = fs::read(&graph_path)?;
     let b_len = bytes.len();
 
@@ -69,108 +70,159 @@ fn main() -> std::io::Result<()> {
     }
     let body_start = p;
 
-    // Pass 1: Count forward and backward degrees
-    let mut f_deg = vec![0u32; n];
-    let mut b_deg = vec![0u32; n];
-    while p < b_len {
-        while p < b_len && (bytes[p] == b' ' || bytes[p] == b'\r' || bytes[p] == b'\n') {
-            p += 1;
+    // Parallel 2-Pass Graph Builder across 6 threads
+    const NUM_PARSERS: usize = 6;
+    let data_len = b_len - body_start;
+    let approx_p = data_len / NUM_PARSERS;
+    let mut chunk_bounds = Vec::with_capacity(NUM_PARSERS + 1);
+    chunk_bounds.push(body_start);
+    for i in 1..NUM_PARSERS {
+        let mut pos = body_start + i * approx_p;
+        while pos < b_len && bytes[pos] != b'\n' {
+            pos += 1;
         }
-        if p >= b_len {
-            break;
-        }
-        let mut u = 0usize;
-        while p < b_len && bytes[p] >= b'0' && bytes[p] <= b'9' {
-            u = u * 10 + (bytes[p] - b'0') as usize;
-            p += 1;
-        }
-        while p < b_len && bytes[p] == b' ' {
-            p += 1;
-        }
-        let mut v = 0usize;
-        while p < b_len && bytes[p] >= b'0' && bytes[p] <= b'9' {
-            v = v * 10 + (bytes[p] - b'0') as usize;
-            p += 1;
-        }
-        f_deg[u] += 1;
-        b_deg[v] += 1;
-
-        while p < b_len && bytes[p] != b'\n' {
-            p += 1;
-        }
-        if p < b_len {
-            p += 1;
-        }
+        chunk_bounds.push((pos + 1).min(b_len));
     }
+    chunk_bounds.push(b_len);
 
-    // Build CSR offsets
+    let mut worker_f_degs: Vec<Vec<u32>> = (0..NUM_PARSERS).map(|_| vec![0u32; n]).collect();
+    let mut worker_b_degs: Vec<Vec<u32>> = (0..NUM_PARSERS).map(|_| vec![0u32; n]).collect();
+
+    thread::scope(|s| {
+        let b_slice = &bytes;
+        for (w_idx, (w_f, w_b)) in worker_f_degs.iter_mut().zip(worker_b_degs.iter_mut()).enumerate() {
+            let start = chunk_bounds[w_idx];
+            let end = chunk_bounds[w_idx + 1];
+            s.spawn(move || {
+                let slice = &b_slice[start..end];
+                let len = slice.len();
+                let mut p = 0;
+                while p < len {
+                    while p < len && (slice[p] == b' ' || slice[p] == b'\r' || slice[p] == b'\n') {
+                        p += 1;
+                    }
+                    if p >= len {
+                        break;
+                    }
+                    let mut u = 0usize;
+                    while p < len && slice[p] >= b'0' && slice[p] <= b'9' {
+                        u = u * 10 + (slice[p] - b'0') as usize;
+                        p += 1;
+                    }
+                    while p < len && slice[p] == b' ' {
+                        p += 1;
+                    }
+                    let mut v = 0usize;
+                    while p < len && slice[p] >= b'0' && slice[p] <= b'9' {
+                        v = v * 10 + (slice[p] - b'0') as usize;
+                        p += 1;
+                    }
+                    w_f[u] += 1;
+                    w_b[v] += 1;
+
+                    while p < len && slice[p] != b'\n' {
+                        p += 1;
+                    }
+                    if p < len {
+                        p += 1;
+                    }
+                }
+            });
+        }
+    });
+
+    // Build CSR offsets and convert worker degrees into starting offsets in-place
     let mut f_offsets = vec![0u32; n + 1];
     let mut b_offsets = vec![0u32; n + 1];
-    for i in 0..n {
-        f_offsets[i + 1] = f_offsets[i] + f_deg[i];
-        b_offsets[i + 1] = b_offsets[i] + b_deg[i];
+    for u in 0..n {
+        let mut cur_f = f_offsets[u];
+        let mut cur_b = b_offsets[u];
+        for w in 0..NUM_PARSERS {
+            let deg_f = worker_f_degs[w][u];
+            let deg_b = worker_b_degs[w][u];
+            worker_f_degs[w][u] = cur_f;
+            worker_b_degs[w][u] = cur_b;
+            cur_f += deg_f;
+            cur_b += deg_b;
+        }
+        f_offsets[u + 1] = cur_f;
+        b_offsets[u + 1] = cur_b;
     }
-    drop(f_deg);
-    drop(b_deg);
+    let worker_f_starts = worker_f_degs;
+    let worker_b_starts = worker_b_degs;
 
     let mut f_targets = vec![0u32; m];
     let mut f_weights = vec![0u32; m];
     let mut b_targets = vec![0u32; m];
     let mut b_weights = vec![0u32; m];
-    let mut f_cur = f_offsets.clone();
-    let mut b_cur = b_offsets.clone();
 
-    // Pass 2: Fill forward and backward CSR
-    p = body_start;
-    while p < b_len {
-        while p < b_len && (bytes[p] == b' ' || bytes[p] == b'\r' || bytes[p] == b'\n') {
-            p += 1;
-        }
-        if p >= b_len {
-            break;
-        }
-        let mut u = 0usize;
-        while p < b_len && bytes[p] >= b'0' && bytes[p] <= b'9' {
-            u = u * 10 + (bytes[p] - b'0') as usize;
-            p += 1;
-        }
-        while p < b_len && bytes[p] == b' ' {
-            p += 1;
-        }
-        let mut v = 0u32;
-        while p < b_len && bytes[p] >= b'0' && bytes[p] <= b'9' {
-            v = v * 10 + (bytes[p] - b'0') as u32;
-            p += 1;
-        }
-        while p < b_len && bytes[p] == b' ' {
-            p += 1;
-        }
-        let mut w = 0u32;
-        while p < b_len && bytes[p] >= b'0' && bytes[p] <= b'9' {
-            w = w * 10 + (bytes[p] - b'0') as u32;
-            p += 1;
-        }
-        while p < b_len && bytes[p] != b'\n' {
-            p += 1;
-        }
-        if p < b_len {
-            p += 1;
-        }
+    let f_targets_ptr = f_targets.as_mut_ptr() as usize;
+    let f_weights_ptr = f_weights.as_mut_ptr() as usize;
+    let b_targets_ptr = b_targets.as_mut_ptr() as usize;
+    let b_weights_ptr = b_weights.as_mut_ptr() as usize;
 
-        let f_dest = f_cur[u] as usize;
-        f_cur[u] += 1;
-        f_targets[f_dest] = v;
-        f_weights[f_dest] = w;
+    thread::scope(|s| {
+        let b_slice = &bytes;
+        for (w_idx, (mut w_f, mut w_b)) in worker_f_starts.into_iter().zip(worker_b_starts.into_iter()).enumerate() {
+            let start = chunk_bounds[w_idx];
+            let end = chunk_bounds[w_idx + 1];
+            s.spawn(move || {
+                let slice = &b_slice[start..end];
+                let len = slice.len();
+                let mut p = 0;
+                while p < len {
+                    while p < len && (slice[p] == b' ' || slice[p] == b'\r' || slice[p] == b'\n') {
+                        p += 1;
+                    }
+                    if p >= len {
+                        break;
+                    }
+                    let mut u = 0usize;
+                    while p < len && slice[p] >= b'0' && slice[p] <= b'9' {
+                        u = u * 10 + (slice[p] - b'0') as usize;
+                        p += 1;
+                    }
+                    while p < len && slice[p] == b' ' {
+                        p += 1;
+                    }
+                    let mut v = 0u32;
+                    while p < len && slice[p] >= b'0' && slice[p] <= b'9' {
+                        v = v * 10 + (slice[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    while p < len && slice[p] == b' ' {
+                        p += 1;
+                    }
+                    let mut w = 0u32;
+                    while p < len && slice[p] >= b'0' && slice[p] <= b'9' {
+                        w = w * 10 + (slice[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    while p < len && slice[p] != b'\n' {
+                        p += 1;
+                    }
+                    if p < len {
+                        p += 1;
+                    }
 
-        let b_dest = b_cur[v as usize] as usize;
-        b_cur[v as usize] += 1;
-        b_targets[b_dest] = u as u32;
-        b_weights[b_dest] = w;
-    }
+                    let f_dest = w_f[u] as usize;
+                    w_f[u] += 1;
+                    let b_dest = w_b[v as usize] as usize;
+                    w_b[v as usize] += 1;
+
+                    // Invariant: worker chunks partition each node's forward and backward degree strictly disjointly
+                    unsafe {
+                        *(f_targets_ptr as *mut u32).add(f_dest) = v;
+                        *(f_weights_ptr as *mut u32).add(f_dest) = w;
+                        *(b_targets_ptr as *mut u32).add(b_dest) = u as u32;
+                        *(b_weights_ptr as *mut u32).add(b_dest) = w;
+                    }
+                }
+            });
+        }
+    });
 
     drop(bytes);
-    drop(f_cur);
-    drop(b_cur);
 
     let f_graph = Graph {
         offsets: f_offsets,
@@ -378,5 +430,6 @@ fn main() -> std::io::Result<()> {
     }
 
     writer.flush()?;
+
     Ok(())
 }
