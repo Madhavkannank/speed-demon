@@ -107,7 +107,6 @@ fn load_regions(
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
-    // Skip header region_id,country
     let _header = lines.next();
 
     let mut country_names = vec!["_UNMATCHED".to_string()];
@@ -160,8 +159,12 @@ fn main() -> std::io::Result<()> {
     let records_file = File::open(&records_path)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, records_file);
 
-    let mut fields: Vec<Vec<u8>> = Vec::with_capacity(5);
-    let mut cur_field = Vec::with_capacity(128);
+    let mut f0 = Vec::with_capacity(32);
+    let mut f1 = Vec::with_capacity(128);
+    let mut f2_len: usize = 0;
+    let mut f3 = Vec::with_capacity(16);
+    let mut f4 = Vec::with_capacity(16);
+    let mut field_idx = 0usize;
 
     let mut buf = [0u8; 64 * 1024];
 
@@ -175,48 +178,59 @@ fn main() -> std::io::Result<()> {
     let mut state = State::StartField;
     let mut is_header = true;
 
+    macro_rules! push_byte {
+        ($b:expr) => {
+            match field_idx {
+                0 => f0.push($b),
+                1 => f1.push($b),
+                2 => f2_len += 1,
+                3 => f3.push($b),
+                4 => f4.push($b),
+                _ => {}
+            }
+        };
+    }
+
     macro_rules! finish_row {
         () => {
-            if !fields.is_empty() || !cur_field.is_empty() {
-                fields.push(std::mem::take(&mut cur_field));
-                if fields.len() == 5 {
-                    // Strip BOM if present on field 0
-                    if fields[0].starts_with(&[0xEF, 0xBB, 0xBF]) {
-                        fields[0].drain(0..3);
-                    }
-
-                    if is_header {
-                        is_header = false;
-                    } else {
-                        let id = parse_id(&fields[0]);
-                        let reg_id = parse_region_id(&fields[3]);
-                        let cents = parse_cents(&fields[4]);
-
-                        let name_bytes = &fields[1];
-                        let name_len = name_bytes.len();
-                        let name_id = match name_pool.get(name_bytes.as_slice()) {
-                            Some(&nid) => nid,
-                            None => {
-                                let boxed: Box<[u8]> = name_bytes.as_slice().into();
-                                let nid = name_pool.len() as u32;
-                                name_pool.insert(boxed, nid);
-                                nid
-                            }
-                        };
-
-                        let note_len = fields[2].len();
-
-                        let country_id = if (reg_id as usize) < region_map.len() {
-                            region_map[reg_id as usize] as usize
-                        } else {
-                            0
-                        };
-
-                        aggregates[country_id].add(id, name_id, name_len, note_len, cents);
-                    }
+            if field_idx == 4 {
+                if f0.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                    f0.drain(0..3);
                 }
-                fields.clear();
+
+                if is_header {
+                    is_header = false;
+                } else {
+                    let id = parse_id(&f0);
+                    let reg_id = parse_region_id(&f3);
+                    let cents = parse_cents(&f4);
+
+                    let name_len = f1.len();
+                    let name_id = match name_pool.get(f1.as_slice()) {
+                        Some(&nid) => nid,
+                        None => {
+                            let boxed: Box<[u8]> = f1.as_slice().into();
+                            let nid = name_pool.len() as u32;
+                            name_pool.insert(boxed, nid);
+                            nid
+                        }
+                    };
+
+                    let country_id = if (reg_id as usize) < region_map.len() {
+                        region_map[reg_id as usize] as usize
+                    } else {
+                        0
+                    };
+
+                    aggregates[country_id].add(id, name_id, name_len, f2_len, cents);
+                }
             }
+            f0.clear();
+            f1.clear();
+            f2_len = 0;
+            f3.clear();
+            f4.clear();
+            field_idx = 0;
         };
     }
 
@@ -232,7 +246,7 @@ fn main() -> std::io::Result<()> {
                 State::StartField => match b {
                     b'"' => state = State::InQuoted,
                     b',' => {
-                        fields.push(std::mem::take(&mut cur_field));
+                        field_idx += 1;
                     }
                     b'\r' => {}
                     b'\n' => {
@@ -240,33 +254,13 @@ fn main() -> std::io::Result<()> {
                         state = State::StartField;
                     }
                     _ => {
-                        cur_field.push(b);
+                        push_byte!(b);
                         state = State::InUnquoted;
                     }
                 },
                 State::InUnquoted => match b {
                     b',' => {
-                        fields.push(std::mem::take(&mut cur_field));
-                        state = State::StartField;
-                    }
-                    b'\r' => {}
-                    b'\n' => {
-                        finish_row!();
-                        state = State::StartField;
-                    }
-                    _ => cur_field.push(b),
-                },
-                State::InQuoted => match b {
-                    b'"' => state = State::AfterQuote,
-                    _ => cur_field.push(b),
-                },
-                State::AfterQuote => match b {
-                    b'"' => {
-                        cur_field.push(b'"');
-                        state = State::InQuoted;
-                    }
-                    b',' => {
-                        fields.push(std::mem::take(&mut cur_field));
+                        field_idx += 1;
                         state = State::StartField;
                     }
                     b'\r' => {}
@@ -275,7 +269,31 @@ fn main() -> std::io::Result<()> {
                         state = State::StartField;
                     }
                     _ => {
-                        cur_field.push(b);
+                        push_byte!(b);
+                    }
+                },
+                State::InQuoted => match b {
+                    b'"' => state = State::AfterQuote,
+                    _ => {
+                        push_byte!(b);
+                    }
+                },
+                State::AfterQuote => match b {
+                    b'"' => {
+                        push_byte!(b'"');
+                        state = State::InQuoted;
+                    }
+                    b',' => {
+                        field_idx += 1;
+                        state = State::StartField;
+                    }
+                    b'\r' => {}
+                    b'\n' => {
+                        finish_row!();
+                        state = State::StartField;
+                    }
+                    _ => {
+                        push_byte!(b);
                     }
                 },
             }
