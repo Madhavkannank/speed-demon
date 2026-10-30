@@ -298,7 +298,7 @@ fn main() -> std::io::Result<()> {
                                 let next_cost = cost + w;
                                 let v_idx = v as usize;
 
-                                if next_cost < f_dist[v_idx] {
+                                if next_cost < f_dist[v_idx] && next_cost < mu {
                                     if f_dist[v_idx] == u64::MAX {
                                         f_touched.push(v);
                                     }
@@ -329,7 +329,7 @@ fn main() -> std::io::Result<()> {
                                 let next_cost = cost + w;
                                 let u_idx = u as usize;
 
-                                if next_cost < b_dist[u_idx] {
+                                if next_cost < b_dist[u_idx] && next_cost < mu {
                                     if b_dist[u_idx] == u64::MAX {
                                         b_touched.push(u);
                                     }
