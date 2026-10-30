@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::thread;
@@ -49,6 +49,49 @@ fn get_hour_idx(ts: &[u8]) -> usize {
     }
 }
 
+#[inline(always)]
+fn write_u32(buf: &mut Vec<u8>, mut n: u32) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut temp = [0u8; 10];
+    let mut i = 10;
+    while n > 0 {
+        i -= 1;
+        temp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    buf.extend_from_slice(&temp[i..]);
+}
+
+#[inline(always)]
+fn fast_hash(b: &[u8]) -> u64 {
+    let ep_len = b.len();
+    let mut h = (ep_len as u64).wrapping_mul(0x517cc1b727220a95);
+    if ep_len < 8 {
+        for &byte in b {
+            h = (h.rotate_left(5) ^ (byte as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+    } else {
+        let mut k = 0;
+        while k + 8 <= ep_len {
+            let mut word_bytes = [0u8; 8];
+            word_bytes.copy_from_slice(&b[k..k + 8]);
+            let word = u64::from_le_bytes(word_bytes);
+            h = (h.rotate_left(7) ^ word).wrapping_mul(0x517cc1b727220a95);
+            k += 8;
+        }
+        if k < ep_len {
+            let mut word_bytes = [0u8; 8];
+            word_bytes.copy_from_slice(&b[ep_len - 8..ep_len]);
+            let word = u64::from_le_bytes(word_bytes);
+            h = (h.rotate_left(7) ^ word).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+    h
+}
+
 #[derive(Clone, Copy)]
 struct HashSlot {
     hash: u64,
@@ -70,7 +113,7 @@ struct WorkerOutput {
     chunks: Vec<LatChunk>,
 }
 
-const TABLE_SIZE: usize = 4096;
+const TABLE_SIZE: usize = 8192;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
 const NUM_WORKERS: usize = 6;
 const CHUNK_SIZE: usize = 512 * 1024;
@@ -106,14 +149,12 @@ fn main() -> std::io::Result<()> {
         }
         idx += 1;
         let ep_start = idx;
-        let mut h = 0x517cc1b727220a95u64;
         while idx < head_read_size && head_buf[idx] != b' ' {
-            let b = head_buf[idx];
-            h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
             idx += 1;
         }
         let ep_len = idx - ep_start;
         let ep_slice = &head_buf[ep_start..idx];
+        let h = fast_hash(ep_slice);
 
         let mut slot = (h as usize) & TABLE_MASK;
         loop {
@@ -149,10 +190,7 @@ fn main() -> std::io::Result<()> {
     // 3. Build fast lookup table
     let mut ep_table = vec![HashSlot { hash: 0, len: 0, id: 0 }; TABLE_SIZE];
     for (i, ep) in ep_strings.iter().enumerate() {
-        let mut h = 0x517cc1b727220a95u64;
-        for &b in ep {
-            h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
-        }
+        let h = fast_hash(ep);
         let mut slot = (h as usize) & TABLE_MASK;
         loop {
             if ep_table[slot].len == 0 {
@@ -238,13 +276,12 @@ fn main() -> std::io::Result<()> {
                 };
 
                 let mut idx = ep_start;
-                let mut h = 0x517cc1b727220a95u64;
                 while idx < last_nl && slice[idx] != b' ' {
-                    let b = slice[idx];
-                    h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
                     idx += 1;
                 }
                 let ep_len = idx - ep_start;
+                let ep_slice = &slice[ep_start..idx];
+                let h = fast_hash(ep_slice);
 
                 let mut slot = (h as usize) & TABLE_MASK;
                 let ep_id = loop {
@@ -302,52 +339,85 @@ fn main() -> std::io::Result<()> {
 
     let workers: Vec<WorkerOutput> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-    // 5. Stream output directly in sorted order
-    let out_file = File::create(&out_path)?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
-    let mut scratch: Vec<u32> = Vec::with_capacity(4096);
+    // 5. Parallel sort and format across 6 threads
+    let workers_ref: &'static [WorkerOutput] = Box::leak(workers.into_boxed_slice());
+    let ep_strings_ref: &'static [Vec<u8>] = Box::leak(ep_strings.into_boxed_slice());
 
-    for hour_idx in 0..72 {
-        let hour_str = HOURS[hour_idx];
-        for (ep_id, ep) in ep_strings.iter().enumerate() {
-            let group_id = hour_idx * num_eps + ep_id;
+    let mut sort_handles = Vec::with_capacity(NUM_WORKERS);
+    let hours_per_worker = 72 / NUM_WORKERS;
 
-            let mut count = 0u32;
-            let mut errors = 0u32;
-            for w in &workers {
-                let s = w.stats[group_id];
-                count += s & 0xFFFF;
-                errors += s >> 16;
-            }
+    for t in 0..NUM_WORKERS {
+        let start_h = t * hours_per_worker;
+        let end_h = (t + 1) * hours_per_worker;
 
-            if count == 0 {
-                continue;
-            }
+        let handle = thread::spawn(move || {
+            let mut buf = Vec::with_capacity(2 * 1024 * 1024);
+            let mut scratch = Vec::with_capacity(4096);
 
-            scratch.clear();
-            for w in &workers {
-                let mut curr = w.heads[group_id];
-                while curr != u32::MAX {
-                    let chunk = &w.chunks[curr as usize];
-                    let chunk_cnt = chunk.count as usize;
-                    scratch.extend_from_slice(&chunk.lats[..chunk_cnt]);
-                    curr = chunk.next;
+            for hour_idx in start_h..end_h {
+                let hour_bytes = HOURS[hour_idx].as_bytes();
+                for (ep_id, ep) in ep_strings_ref.iter().enumerate() {
+                    let group_id = hour_idx * num_eps + ep_id;
+
+                    let mut count = 0u32;
+                    let mut errors = 0u32;
+                    for w in workers_ref {
+                        let s = w.stats[group_id];
+                        count += s & 0xFFFF;
+                        errors += s >> 16;
+                    }
+
+                    if count == 0 {
+                        continue;
+                    }
+
+                    scratch.clear();
+                    for w in workers_ref {
+                        let mut curr = w.heads[group_id];
+                        while curr != u32::MAX {
+                            let chunk = &w.chunks[curr as usize];
+                            let chunk_cnt = chunk.count as usize;
+                            scratch.extend_from_slice(&chunk.lats[..chunk_cnt]);
+                            curr = chunk.next;
+                        }
+                    }
+
+                    scratch.sort_unstable();
+                    let n = scratch.len();
+                    let p50 = scratch[(50 * n + 99) / 100 - 1];
+                    let p95 = scratch[(95 * n + 99) / 100 - 1];
+                    let p99 = scratch[(99 * n + 99) / 100 - 1];
+                    let error_ppm = (errors as u64 * 1_000_000 / count as u64) as u32;
+
+                    buf.extend_from_slice(hour_bytes);
+                    buf.push(b' ');
+                    buf.extend_from_slice(ep);
+                    buf.push(b' ');
+                    write_u32(&mut buf, count);
+                    buf.push(b' ');
+                    write_u32(&mut buf, p50);
+                    buf.push(b' ');
+                    write_u32(&mut buf, p95);
+                    buf.push(b' ');
+                    write_u32(&mut buf, p99);
+                    buf.push(b' ');
+                    write_u32(&mut buf, errors);
+                    buf.push(b' ');
+                    write_u32(&mut buf, error_ppm);
+                    buf.push(b'\n');
                 }
             }
-
-            scratch.sort_unstable();
-            let n = scratch.len();
-            let p50 = scratch[(50 * n + 99) / 100 - 1];
-            let p95 = scratch[(95 * n + 99) / 100 - 1];
-            let p99 = scratch[(99 * n + 99) / 100 - 1];
-            let error_ppm = (errors as u64 * 1_000_000 / count as u64) as u32;
-
-            write!(writer, "{} ", hour_str)?;
-            writer.write_all(ep)?;
-            writeln!(writer, " {} {} {} {} {} {}", count, p50, p95, p99, errors, error_ppm)?;
-        }
+            buf
+        });
+        sort_handles.push(handle);
     }
-    writer.flush()?;
+
+    let mut out_file = File::create(&out_path)?;
+    for handle in sort_handles {
+        let buf = handle.join().unwrap();
+        out_file.write_all(&buf)?;
+    }
+    out_file.flush()?;
 
     Ok(())
 }
