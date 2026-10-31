@@ -69,23 +69,21 @@ fn write_u32(buf: &mut Vec<u8>, mut n: u32) {
 fn fast_hash(b: &[u8]) -> u64 {
     let ep_len = b.len();
     let mut h = (ep_len as u64).wrapping_mul(0x517cc1b727220a95);
+    let ptr = b.as_ptr();
     if ep_len < 8 {
-        for &byte in b {
+        for i in 0..ep_len {
+            let byte = unsafe { *ptr.add(i) };
             h = (h.rotate_left(5) ^ (byte as u64)).wrapping_mul(0x517cc1b727220a95);
         }
     } else {
         let mut k = 0;
         while k + 8 <= ep_len {
-            let mut word_bytes = [0u8; 8];
-            word_bytes.copy_from_slice(&b[k..k + 8]);
-            let word = u64::from_le_bytes(word_bytes);
+            let word = unsafe { (ptr.add(k) as *const u64).read_unaligned() };
             h = (h.rotate_left(7) ^ word).wrapping_mul(0x517cc1b727220a95);
             k += 8;
         }
         if k < ep_len {
-            let mut word_bytes = [0u8; 8];
-            word_bytes.copy_from_slice(&b[ep_len - 8..ep_len]);
-            let word = u64::from_le_bytes(word_bytes);
+            let word = unsafe { (ptr.add(ep_len - 8) as *const u64).read_unaligned() };
             h = (h.rotate_left(7) ^ word).wrapping_mul(0x517cc1b727220a95);
         }
     }
@@ -115,7 +113,7 @@ struct WorkerOutput {
 
 const TABLE_SIZE: usize = 8192;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
-const NUM_WORKERS: usize = 6;
+const NUM_WORKERS: usize = 12;
 const CHUNK_SIZE: usize = 512 * 1024;
 
 fn main() -> std::io::Result<()> {
@@ -259,8 +257,18 @@ fn main() -> std::io::Result<()> {
 
                 let slice = &buf[..last_nl];
                 let mut pos = 0;
+                let mut last_hour_str = [0u8; 13];
+                let mut cached_hour_idx = 0usize;
+
                 while pos + 35 <= last_nl {
-                    let hour_idx = get_hour_idx(&slice[pos..pos + 13]);
+                    let hour_prefix = &slice[pos..pos + 13];
+                    let hour_idx = if hour_prefix == &last_hour_str {
+                        cached_hour_idx
+                    } else {
+                        last_hour_str.copy_from_slice(hour_prefix);
+                        cached_hour_idx = get_hour_idx(hour_prefix);
+                        cached_hour_idx
+                    };
 
                 // Method starts at pos + 28
                 let ep_start = if slice[pos + 31] == b' ' {
@@ -351,7 +359,7 @@ fn main() -> std::io::Result<()> {
         let end_h = (t + 1) * hours_per_worker;
 
         let handle = thread::spawn(move || {
-            let mut buf = Vec::with_capacity(2 * 1024 * 1024);
+            let mut buf = Vec::with_capacity(900 * 1024);
             let mut scratch = Vec::with_capacity(4096);
 
             for hour_idx in start_h..end_h {
