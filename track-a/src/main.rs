@@ -41,7 +41,7 @@ let mut chunk = LatChunk { lats: [0; 14], count: 2, _pad: [0; 3], next: u32::MAX
 if chunks[c_idx].count < 14 { let n = chunks[c_idx].count as usize; chunks[c_idx].lats[n] = lat; chunks[c_idx].count += 1; } else { let new_idx = chunks.len() as u32; let mut chunk = LatChunk { lats: [0; 14], count: 1, _pad: [0; 3], next: g.head };
 chunk.lats[0] = lat; chunks.push(chunk); g.head = new_idx; } } } rem_len = total_available - last_nl; if rem_len > 0 { buf.copy_within(last_nl..total_available, 0); } } WorkerOutput { base_h, num_h, groups, chunks } }).unwrap(); handles.push(handle); }
 let workers: Vec<WorkerOutput> = handles.into_iter().map(|h| h.join().unwrap()).collect(); let workers_ref: &'static [WorkerOutput] = Box::leak(workers.into_boxed_slice());
-let out_handles: Vec<_> = (0..12).map(|t| thread::Builder::new().stack_size(256 * 1024).spawn(move || { let (h_start, h_end) = (t * 6, (t + 1) * 6); let mut buf = Vec::with_capacity(480_000); let mut scratch = Vec::with_capacity(4096);
+let out_handles: Vec<_> = (0..12).map(|t| thread::Builder::new().stack_size(256 * 1024).spawn(move || { let (h_start, h_end) = (t * 6, (t + 1) * 6); let mut buf = Vec::with_capacity(900_000); let mut scratch = Vec::with_capacity(4096);
 for hour_idx in h_start..h_end { let hour_bytes = get_hour_str(hour_idx); let active_w: Vec<&WorkerOutput> = workers_ref.iter().filter(|w| hour_idx >= w.base_h && hour_idx < w.base_h + w.num_h).collect();
 for (ep_id, ep) in ep_strings_ref.iter().enumerate() { let (mut count, mut errors) = (0u32, 0u32); for w in &active_w {
 let g = &w.groups[(hour_idx - w.base_h) * num_eps + ep_id]; count += g.stat & 0xFFFF; errors += g.stat >> 16; } if count == 0 { continue; }
