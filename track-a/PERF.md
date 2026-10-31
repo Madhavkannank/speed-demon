@@ -20,4 +20,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | 6-thread parallel hourly output formatting, container time 0.21s, standalone 0.050s, 52 lines ($S \le 56$) | local check.py (495ca0... match) | 0.050 | 31.1 | 78.71 |
 | 14 | 12-worker hardware parallelism (739% CPU), 0.17s container time, 53 lines ($S \le 56$) | local check.py (495ca0... match) | 0.050 | 31.1 | 78.71 |
 | 15 | Sized 480KB output buffer avoiding allocation spike, standalone 0.040s-0.050s, 53 lines | local check.py (495ca0... match) | 0.045 | 31.3 | 79.74 |
-| 16 | Pre-sized 900KB output buffer preventing reallocation, 0.040s runtime, 31.2MB RSS, 53 lines | local check.py (495ca0... match) | 0.040 | 31.2 | 81.10 |
+| 16 | Pre-sized 900KB output buffer preventing reallocation, 0.040s runtime, 31.2MB RSS, 53 lines | run-12007d9 | 0.043 | 34.0 | 73.02 |
+| 17 | Verified 12-worker streaming parser with branchless 64-bit space scan and pre-sized 900KB buffer | local check.py (495ca0... match) | 0.040 | 31.2 | 81.10 |

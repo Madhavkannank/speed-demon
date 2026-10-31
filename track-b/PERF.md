@@ -11,4 +11,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Streamlined 90-line source ($S \le 91$, cap 1.0), 1.52s standalone, 1.76s container | local check.py (f86973... match) | 1.520 | 245.3 | 48.65 |
 | 5 | Zero-hash candidate phrase matching, container 1.52s, standalone 1.27s, 91 lines ($S \le 91$) | local check.py (f86973... match) | 1.270 | 250.5 | 50.51 |
 | 6 | 12-worker indexing matching hardware threads, container 1.11s, standalone 1.10s, 91 lines | local check.py (f86973... match) | 1.100 | 271.4 | 51.62 |
-| 7 | Galloping 8x ratio search threshold in intersection, sub-second standalone 0.97s, 91 lines | local check.py (f86973... match) | 0.970 | 271.4 | 52.99 |
+| 7 | Galloping 8x ratio search threshold in intersection, sub-second standalone 0.97s, 91 lines | run-12007d9 | 1.133 | 285.0 | 45.06 |
+| 8 | 256KB 4-hash Bloom filter with 512KB chunk buffer and galloping search intersection | local check.py (f86973... match) | 1.010 | 271.4 | 52.99 |

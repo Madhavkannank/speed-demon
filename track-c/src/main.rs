@@ -49,7 +49,7 @@ for w_idx in 0..NUM_WORKERS {
 let (start_pos, end_pos, path, bar) = (chunk_bounds[w_idx], chunk_bounds[w_idx + 1], records_path.clone(), Arc::clone(&barrier));
 let (names_ptrs, offsets_ptrs, aggs_ptrs) = (worker_names_ptrs.clone(), worker_offsets_ptrs.clone(), worker_aggs_ptrs.clone());
 s.spawn(move || {
-let t_file = File::open(&path).unwrap(); let (mut aggs, mut names, mut buf) = (vec![LocalAgg::new(); num_countries], Vec::with_capacity(300_000), vec![0u8; CHUNK_SIZE + 8192]);
+let t_file = File::open(&path).unwrap(); let (mut aggs, mut names, mut buf) = (vec![LocalAgg::new(); num_countries], Vec::with_capacity(280_000), vec![0u8; CHUNK_SIZE + 8192]);
 let (mut cur_offset, mut rem_len) = (start_pos, 0);
 while cur_offset < end_pos || rem_len > 0 {
 let to_read = (CHUNK_SIZE).min(end_pos.saturating_sub(cur_offset));
