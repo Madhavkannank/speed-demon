@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::thread;
@@ -113,7 +113,7 @@ struct WorkerOutput {
 
 const TABLE_SIZE: usize = 8192;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
-const NUM_WORKERS: usize = 6;
+const NUM_WORKERS: usize = 12;
 const CHUNK_SIZE: usize = 512 * 1024;
 
 fn main() -> std::io::Result<()> {
@@ -123,7 +123,7 @@ fn main() -> std::io::Result<()> {
     let input_path = Path::new(&data_dir).join("requests.log");
     let out_path = Path::new(&out_dir).join("summary.txt");
 
-    let file = File::open(&input_path)?;
+    let mut file = File::open(&input_path)?;
     let file_len = file.metadata()?.len() as usize;
 
     if file_len == 0 {
@@ -131,69 +131,52 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // 1. Discover unique endpoints by streaming in 256 KB chunks until all 1842 are found
+    // 1. Discover unique endpoints from first 8 MB
     let mut probe_table = vec![HashSlot { hash: 0, len: 0, id: 0 }; TABLE_SIZE];
     let mut ep_strings: Vec<Vec<u8>> = Vec::with_capacity(2048);
 
-    let mut head_buf = vec![0u8; 256 * 1024 + 4096];
-    let mut h_offset = 0;
-    let mut h_rem = 0;
+    let head_read_size = file_len.min(8 * 1024 * 1024);
+    let mut head_buf = vec![0u8; head_read_size];
+    file.read_exact(&mut head_buf)?;
 
-    while h_offset < file_len && ep_strings.len() < 1842 {
-        let to_read = (256 * 1024).min(file_len - h_offset);
-        file.read_exact_at(&mut head_buf[h_rem..h_rem + to_read], h_offset as u64)?;
-        h_offset += to_read;
-        let available = h_rem + to_read;
-
-        let mut last_nl = available;
-        while last_nl > 0 && head_buf[last_nl - 1] != b'\n' {
-            last_nl -= 1;
-        }
-
-        let mut pos = 0;
-        while pos + 35 <= last_nl {
-            let mut idx = pos + 28;
-            while idx < last_nl && head_buf[idx] != b' ' {
-                idx += 1;
-            }
+    let mut pos = 0;
+    while pos + 35 <= head_read_size {
+        let mut idx = pos + 28;
+        while idx < head_read_size && head_buf[idx] != b' ' {
             idx += 1;
-            let ep_start = idx;
-            while idx < last_nl && head_buf[idx] != b' ' {
-                idx += 1;
-            }
-            let ep_len = idx - ep_start;
-            let ep_slice = &head_buf[ep_start..idx];
-            let h = fast_hash(ep_slice);
+        }
+        idx += 1;
+        let ep_start = idx;
+        while idx < head_read_size && head_buf[idx] != b' ' {
+            idx += 1;
+        }
+        let ep_len = idx - ep_start;
+        let ep_slice = &head_buf[ep_start..idx];
+        let h = fast_hash(ep_slice);
 
-            let mut slot = (h as usize) & TABLE_MASK;
-            loop {
-                let entry = &probe_table[slot];
-                if entry.hash == h && entry.len as usize == ep_len {
-                    break;
-                }
-                if entry.len == 0 {
-                    let id = ep_strings.len() as u16;
-                    probe_table[slot] = HashSlot { hash: h, len: ep_len as u16, id };
-                    ep_strings.push(ep_slice.to_vec());
-                    break;
-                }
-                slot = (slot + 1) & TABLE_MASK;
-            }
-
-            if ep_strings.len() == 1842 {
+        let mut slot = (h as usize) & TABLE_MASK;
+        loop {
+            let entry = &probe_table[slot];
+            if entry.hash == h && entry.len as usize == ep_len {
                 break;
             }
-
-            while idx < last_nl && head_buf[idx] != b'\n' {
-                idx += 1;
+            if entry.len == 0 {
+                let id = ep_strings.len() as u16;
+                probe_table[slot] = HashSlot { hash: h, len: ep_len as u16, id };
+                ep_strings.push(ep_slice.to_vec());
+                break;
             }
-            pos = idx + 1;
+            slot = (slot + 1) & TABLE_MASK;
         }
 
-        h_rem = available - last_nl;
-        if h_rem > 0 {
-            head_buf.copy_within(last_nl..available, 0);
+        if ep_strings.len() == 1842 {
+            break;
         }
+
+        while idx < head_read_size && head_buf[idx] != b'\n' {
+            idx += 1;
+        }
+        pos = idx + 1;
     }
     drop(head_buf);
 
