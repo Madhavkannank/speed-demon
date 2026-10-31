@@ -539,6 +539,7 @@ fn main() -> std::io::Result<()> {
                 let mut scratch = Vec::new();
                 let mut doc_buf = vec![0u8; 8192];
                 let mut doc_tokens = Vec::with_capacity(256);
+                let mut matches = Vec::new();
 
                 for q_idx in start..end {
                     match &queries_ref[q_idx] {
@@ -592,9 +593,13 @@ fn main() -> std::io::Result<()> {
                                 continue;
                             }
 
-                            // Order term checks by posting length ascending
-                            let mut order: Vec<usize> = (0..term_ids.len()).collect();
-                            order.sort_unstable_by_key(|&idx| {
+                            // Order term checks by posting length ascending without heap allocation
+                            let num_tids = term_ids.len().min(16);
+                            let mut order = [0usize; 16];
+                            for idx in 0..num_tids {
+                                order[idx] = idx;
+                            }
+                            order[..num_tids].sort_unstable_by_key(|&idx| {
                                 get_postings(term_ids[idx]).len()
                             });
 
@@ -602,7 +607,7 @@ fn main() -> std::io::Result<()> {
                             let rarest_tid = term_ids[order[0]];
                             cur_res.extend_from_slice(get_postings(rarest_tid));
 
-                            for &idx in &order[1..] {
+                            for &idx in &order[1..num_tids] {
                                 if cur_res.is_empty() {
                                     break;
                                 }
@@ -613,7 +618,7 @@ fn main() -> std::io::Result<()> {
 
                             // Verify consecutive positions on candidate docs
                             let k = term_ids.len();
-                            let mut matches = Vec::new();
+                            matches.clear();
                             for &c_doc in &cur_res {
                                 let f_offset = doc_text_offsets_ref[c_doc as usize];
                                 let t_len = doc_text_lens_ref[c_doc as usize] as usize;
