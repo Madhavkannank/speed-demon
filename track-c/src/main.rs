@@ -89,7 +89,7 @@ fn load_regions(path: &Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
     Ok((region_map, country_names))
 }
 
-const NUM_WORKERS: usize = 6;
+const NUM_WORKERS: usize = 12;
 const CHUNK_SIZE: usize = 1024 * 1024;
 
 fn main() -> std::io::Result<()> {
