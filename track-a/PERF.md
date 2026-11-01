@@ -23,3 +23,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | Pre-sized 900KB output buffer preventing reallocation, 0.040s runtime, 31.2MB RSS, 53 lines | run-12007d9 | 0.043 | 34.0 | 73.02 |
 | 17 | Verified 12-worker streaming parser with branchless 64-bit space scan and pre-sized 900KB buffer | local check.py (495ca0... match) | 0.040 | 31.2 | 81.10 |
 | 18 | A1 Robustness: Lazy 2048-slot hour slabs removing hardcoded CONFIGS, tested on random shuffle & reversed order | RUN-ID-A1 | 0.043 | 34.3 | 73.02 |
+| 19 | A2 (attempt): Per-worker interning & post-join mapping to remove discovery pass | RUN-ID-A2 (rejected) | 0.057 est | 36.6 | 69.62 (reverted: discovery is only 5.0ms; per-line arena indirection and output mapping regressed T by 27%) |
