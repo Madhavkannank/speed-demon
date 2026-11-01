@@ -143,7 +143,7 @@ def evaluate_track(key, runs=7):
                     while f.read(1024 * 1024): pass
             except Exception: pass
 
-    cmd = ["/usr/bin/time", "-v", "taskset", "-c", "0-11", bin_path]
+    cmd = ["/usr/bin/time", "-v", "taskset", "-c", "0-7", bin_path]
     env = os.environ.copy()
     env["DATA_DIR"] = info["data"]
     env["OUT_DIR"] = out_dir
@@ -250,8 +250,8 @@ def run_paired_comparison(key, cand_dir, base_dir, pairs=15, warmups=2):
     env_base["DATA_DIR"] = info["data"]
     env_base["OUT_DIR"] = out_dir_base
 
-    cmd_cand = ["/usr/bin/time", "-v", "taskset", "-c", "0-11", cand_bin]
-    cmd_base = ["/usr/bin/time", "-v", "taskset", "-c", "0-11", base_bin]
+    cmd_cand = ["/usr/bin/time", "-v", "taskset", "-c", "0-7", cand_bin]
+    cmd_base = ["/usr/bin/time", "-v", "taskset", "-c", "0-7", base_bin]
 
     print(f"Running {warmups} warmup rounds...")
     for w in range(warmups):
