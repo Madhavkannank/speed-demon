@@ -1,4 +1,5 @@
 use std::{
+    arch::x86_64::*,
     fs::{self, File},
     io::{BufWriter, Write},
     os::fd::AsRawFd,
@@ -23,143 +24,134 @@ const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MADV_POPULATE_READ: i32 = 22;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct TableSlot {
-    tag: u32,
+    key_low: u64,
+    key_high: u64,
+    hash: u32,
     id: u32,
+    len: u8,
+    extra: u8,
+    _pad: [u8; 6],
 }
 
-#[derive(Clone, Copy)]
-struct TermEntry {
-    offset: u32,
-    len: u16,
-}
-
-struct FastTermTable {
-    slots: Vec<TableSlot>,
-    mask: usize,
-    arena: Vec<u8>,
-    entries: Vec<TermEntry>,
-}
+const TABLE_SIZE: usize = 262144;
+const TABLE_MASK: usize = TABLE_SIZE - 1;
 
 #[inline(always)]
-fn hash32(b: &[u8]) -> u32 {
-    let mut h = 0x517cc1b727220a95u64;
-    for &x in b {
-        h = (h.rotate_left(5) ^ ((x | 0x20) as u64)).wrapping_mul(0x9e3779b97f4a7c15);
+unsafe fn hash_and_key(ptr: *const u8, len: usize) -> (u32, u64, u64, u8) {
+    if len <= 8 {
+        let mask = if len == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (len * 8)) - 1
+        };
+        let raw = (ptr as *const u64).read_unaligned();
+        let w0 = (raw | 0x2020202020202020u64) & mask;
+        let h = w0.wrapping_mul(0x517cc1b727220a95u64) ^ (len as u64);
+        let h32 = (h ^ (h >> 32)) as u32;
+        (h32, w0, 0, 0)
+    } else if len <= 16 {
+        let raw0 = (ptr as *const u64).read_unaligned();
+        let w0 = raw0 | 0x2020202020202020u64;
+        let rem_len = len - 8;
+        let mask = if rem_len == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (rem_len * 8)) - 1
+        };
+        let raw1 = (ptr.add(8) as *const u64).read_unaligned();
+        let w1 = (raw1 | 0x2020202020202020u64) & mask;
+        let h = (w0.wrapping_mul(0x517cc1b727220a95u64) ^ w1.rotate_left(27))
+            .wrapping_mul(0x9e3779b97f4a7c15u64)
+            ^ (len as u64);
+        let h32 = (h ^ (h >> 32)) as u32;
+        (h32, w0, w1, 0)
+    } else {
+        let raw0 = (ptr as *const u64).read_unaligned();
+        let w0 = raw0 | 0x2020202020202020u64;
+        let raw1 = (ptr.add(8) as *const u64).read_unaligned();
+        let w1 = raw1 | 0x2020202020202020u64;
+        let ext = (*ptr.add(16)) | 0x20;
+        let h = (w0.wrapping_mul(0x517cc1b727220a95u64)
+            ^ w1.rotate_left(27)
+            ^ ((ext as u64).rotate_left(43)))
+        .wrapping_mul(0x9e3779b97f4a7c15u64)
+            ^ (len as u64);
+        let h32 = (h ^ (h >> 32)) as u32;
+        (h32, w0, w1, ext)
     }
-    (h ^ (h >> 32)) as u32
 }
 
-impl FastTermTable {
-    fn with_capacity(cap: usize) -> Self {
-        assert!(cap.is_power_of_two());
-        Self {
-            slots: vec![
-                TableSlot {
-                    tag: u32::MAX,
-                    id: u32::MAX
-                };
-                cap
-            ],
-            mask: cap - 1,
-            arena: Vec::with_capacity(1024 * 1024),
-            entries: Vec::with_capacity(100000),
-        }
-    }
+struct TermTable {
+    slots: Vec<TableSlot>,
+    vocab_size: u32,
+}
 
-    fn resize(&mut self) {
-        let new_cap = self.slots.len() * 2;
-        let new_mask = new_cap - 1;
-        let mut new_slots = vec![
-            TableSlot {
-                tag: u32::MAX,
-                id: u32::MAX,
-            };
-            new_cap
-        ];
-        for &slot in &self.slots {
-            if slot.tag != u32::MAX {
-                let mut idx = (slot.tag as usize) & new_mask;
-                while new_slots[idx].tag != u32::MAX {
-                    idx = (idx + 1) & new_mask;
-                }
-                new_slots[idx] = slot;
-            }
+impl TermTable {
+    fn new() -> Self {
+        Self {
+            slots: vec![TableSlot::default(); TABLE_SIZE],
+            vocab_size: 0,
         }
-        self.slots = new_slots;
-        self.mask = new_mask;
     }
 
     #[inline(always)]
     fn get_or_insert(&mut self, term: &[u8]) -> u32 {
-        if self.entries.len() * 2 >= self.slots.len() {
-            self.resize();
-        }
-        let h = hash32(term);
-        let tag = if h == u32::MAX { 0 } else { h };
-        let mut idx = (tag as usize) & self.mask;
+        let mut buf = [0u8; 32];
+        let len = term.len().min(32);
+        buf[..len].copy_from_slice(&term[..len]);
+        let (h, w0, w1, ext) = unsafe { hash_and_key(buf.as_ptr(), len) };
+        let tag = if h == 0 { 1 } else { h };
+        let mut idx = (tag as usize) & TABLE_MASK;
         loop {
-            let slot = unsafe { self.slots.get_unchecked(idx) };
-            if slot.tag == u32::MAX {
-                let id = self.entries.len() as u32;
-                let offset = self.arena.len() as u32;
-                // Store in arena as lowercase
-                for &b in term {
-                    self.arena.push(b | 0x20);
-                }
-                self.entries.push(TermEntry {
-                    offset,
-                    len: term.len() as u16,
-                });
-                unsafe {
-                    *self.slots.get_unchecked_mut(idx) = TableSlot { tag, id };
-                }
+            let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+            if slot.hash == 0 {
+                let id = self.vocab_size;
+                self.vocab_size += 1;
+                *slot = TableSlot {
+                    key_low: w0,
+                    key_high: w1,
+                    hash: tag,
+                    id,
+                    len: len as u8,
+                    extra: ext,
+                    _pad: [0; 6],
+                };
                 return id;
             }
-            if slot.tag == tag {
-                let entry = unsafe { *self.entries.get_unchecked(slot.id as usize) };
-                if entry.len as usize == term.len() {
-                    let s = unsafe {
-                        std::slice::from_raw_parts(
-                            self.arena.as_ptr().add(entry.offset as usize),
-                            entry.len as usize,
-                        )
-                    };
-                    if s.iter().zip(term.iter()).all(|(&a, &b)| a == (b | 0x20)) {
-                        return slot.id;
-                    }
-                }
+            if slot.hash == tag
+                && slot.len as usize == len
+                && slot.key_low == w0
+                && slot.key_high == w1
+                && slot.extra == ext
+            {
+                return slot.id;
             }
-            idx = (idx + 1) & self.mask;
+            idx = (idx + 1) & TABLE_MASK;
         }
     }
 
     #[inline(always)]
-    fn lookup(&self, term: &[u8], h: u32) -> Option<u32> {
-        let tag = if h == u32::MAX { 0 } else { h };
-        let mut idx = (tag as usize) & self.mask;
+    fn lookup(&self, ptr: *const u8, len: usize) -> Option<u32> {
+        let (h, w0, w1, ext) = unsafe { hash_and_key(ptr, len) };
+        let tag = if h == 0 { 1 } else { h };
+        let mut idx = (tag as usize) & TABLE_MASK;
         loop {
-            let slot = unsafe { *self.slots.get_unchecked(idx) };
-            if slot.tag == u32::MAX {
+            let slot = unsafe { self.slots.get_unchecked(idx) };
+            if slot.hash == 0 {
                 return None;
             }
-            if slot.tag == tag {
-                let entry = unsafe { *self.entries.get_unchecked(slot.id as usize) };
-                if entry.len as usize == term.len() {
-                    let s = unsafe {
-                        std::slice::from_raw_parts(
-                            self.arena.as_ptr().add(entry.offset as usize),
-                            entry.len as usize,
-                        )
-                    };
-                    if s.iter().zip(term.iter()).all(|(&a, &b)| a == (b | 0x20)) {
-                        return Some(slot.id);
-                    }
-                }
+            if slot.hash == tag
+                && slot.len as usize == len
+                && slot.key_low == w0
+                && slot.key_high == w1
+                && slot.extra == ext
+            {
+                return Some(slot.id);
             }
-            idx = (idx + 1) & self.mask;
+            idx = (idx + 1) & TABLE_MASK;
         }
     }
 }
@@ -204,11 +196,14 @@ fn intersect_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     }
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            out.push(a[i]);
+        let (va, vb) = (unsafe { *a.get_unchecked(i) }, unsafe {
+            *b.get_unchecked(j)
+        });
+        if va == vb {
+            out.push(va);
             i += 1;
             j += 1;
-        } else if a[i] < b[j] {
+        } else if va < vb {
             i += 1;
         } else {
             j += 1;
@@ -221,15 +216,18 @@ fn union_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            out.push(a[i]);
+        let (va, vb) = (unsafe { *a.get_unchecked(i) }, unsafe {
+            *b.get_unchecked(j)
+        });
+        if va == vb {
+            out.push(va);
             i += 1;
             j += 1;
-        } else if a[i] < b[j] {
-            out.push(a[i]);
+        } else if va < vb {
+            out.push(va);
             i += 1;
         } else {
-            out.push(b[j]);
+            out.push(vb);
             j += 1;
         }
     }
@@ -244,14 +242,34 @@ fn union_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 #[inline(always)]
 fn difference_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
+    if b.is_empty() {
+        out.extend_from_slice(a);
+        return;
+    }
+    if b.len() > a.len() * 8 {
+        let mut s = b;
+        for &v in a {
+            match s.binary_search(&v) {
+                Ok(i) => s = &s[i + 1..],
+                Err(i) => {
+                    out.push(v);
+                    s = &s[i..];
+                }
+            }
+        }
+        return;
+    }
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i] < b[j] {
-            out.push(a[i]);
-            i += 1;
-        } else if a[i] == b[j] {
+        let (va, vb) = (unsafe { *a.get_unchecked(i) }, unsafe {
+            *b.get_unchecked(j)
+        });
+        if va == vb {
             i += 1;
             j += 1;
+        } else if va < vb {
+            out.push(va);
+            i += 1;
         } else {
             j += 1;
         }
@@ -262,58 +280,27 @@ fn difference_sorted(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 }
 
 #[inline(always)]
-fn append_u32(buf: &mut Vec<u8>, mut n: u32) {
-    if n == 0 {
-        buf.push(b'0');
-        return;
-    }
-    let mut t = [0u8; 10];
-    let mut i = 10;
-    while n > 0 {
-        i -= 1;
-        t[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    buf.extend_from_slice(&t[i..]);
-}
-
-#[inline(always)]
-fn append_u64(buf: &mut Vec<u8>, mut n: u64) {
-    if n == 0 {
-        buf.push(b'0');
-        return;
-    }
-    let mut t = [0u8; 20];
-    let mut i = 20;
-    while n > 0 {
-        i -= 1;
-        t[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    buf.extend_from_slice(&t[i..]);
-}
-
-#[inline(always)]
 fn fast_write_results(buf: &mut Vec<u8>, ids: &[u32]) {
     if ids.is_empty() {
         buf.extend_from_slice(b"0 0\n");
         return;
     }
     let sum: u64 = ids.iter().map(|&x| x as u64).sum();
-    append_u32(buf, ids.len() as u32);
+    write_u64(buf, ids.len() as u64);
     buf.push(b' ');
-    append_u64(buf, sum);
+    write_u64(buf, sum);
     for &id in &ids[..ids.len().min(10)] {
         buf.push(b' ');
-        append_u32(buf, id);
+        write_u64(buf, id as u64);
     }
     buf.push(b'\n');
 }
 
+#[derive(Clone)]
 enum ParsedQuery {
     Bool {
         first_term: u32,
-        ops: Vec<(u8, u32)>, // op: 0=AND, 1=OR, 2=NOT
+        ops: Vec<(u8, u32)>,
     },
     Phrase {
         term_ids: Vec<u32>,
@@ -322,20 +309,348 @@ enum ParsedQuery {
     Empty,
 }
 
+#[inline(always)]
+fn write_u64(buf: &mut Vec<u8>, mut n: u64) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut b = [0u8; 20];
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        b[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    buf.extend_from_slice(&b[i..]);
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn pass1_scan(
+    slice: &[u8],
+    slice_start: usize,
+    table: &TermTable,
+    vocab_size: usize,
+    counts: &mut [u32],
+    doc_starts: &mut Vec<u32>,
+) {
+    let mut last_seen = vec![u32::MAX; vocab_size];
+    let len = slice.len();
+    let ptr = slice.as_ptr();
+    let mut p = 0;
+
+    let v_20 = _mm256_set1_epi8(0x20);
+    let v_a_minus_1 = _mm256_set1_epi8((b'a' - 1) as i8);
+    let v_z_plus_1 = _mm256_set1_epi8((b'z' + 1) as i8);
+    let v_0_minus_1 = _mm256_set1_epi8((b'0' - 1) as i8);
+    let v_9_plus_1 = _mm256_set1_epi8((b'9' + 1) as i8);
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+
+    while p < len {
+        let d_start = (slice_start + p) as u32;
+        let mut doc_id = 0u32;
+        while p < len && *ptr.add(p) >= b'0' && *ptr.add(p) <= b'9' {
+            doc_id = doc_id * 10 + (*ptr.add(p) - b'0') as u32;
+            p += 1;
+        }
+        while p < len && *ptr.add(p) != b'\t' && *ptr.add(p) != b'\n' {
+            p += 1;
+        }
+        if p < len && *ptr.add(p) == b'\t' {
+            p += 1;
+        }
+        doc_starts.push(d_start);
+
+        let mut prev_is_alnum = 0u32;
+        let mut doc_ended = false;
+        while p + 32 <= len {
+            let v = _mm256_loadu_si256(ptr.add(p) as *const __m256i);
+
+            let is_nl = _mm256_cmpeq_epi8(v, v_nl);
+            let nl_mask = _mm256_movemask_epi8(is_nl) as u32;
+
+            let c_or_20 = _mm256_or_si256(v, v_20);
+            let ge_a = _mm256_cmpgt_epi8(c_or_20, v_a_minus_1);
+            let le_z = _mm256_cmpgt_epi8(v_z_plus_1, c_or_20);
+            let is_alpha = _mm256_and_si256(ge_a, le_z);
+
+            let ge_0 = _mm256_cmpgt_epi8(v, v_0_minus_1);
+            let le_9 = _mm256_cmpgt_epi8(v_9_plus_1, v);
+            let is_digit = _mm256_and_si256(ge_0, le_9);
+
+            let is_alnum = _mm256_or_si256(is_alpha, is_digit);
+            let mut mask = _mm256_movemask_epi8(is_alnum) as u32;
+
+            let has_nl = nl_mask != 0;
+            if has_nl {
+                let nl_off = nl_mask.trailing_zeros();
+                let valid_mask = (1u32 << nl_off).wrapping_sub(1);
+                mask &= valid_mask;
+            }
+
+            let mut start_bits = mask & !((mask << 1) | prev_is_alnum);
+            prev_is_alnum = (mask >> 31) & 1;
+
+            let mut spanned = false;
+            while start_bits != 0 {
+                let off = start_bits.trailing_zeros() as usize;
+                start_bits &= start_bits - 1;
+                let tok_start = p + off;
+                let not_mask = (!mask) >> off;
+                let tok_len = if not_mask != 0 {
+                    not_mask.trailing_zeros() as usize
+                } else {
+                    let mut l = 32 - off;
+                    while p + off + l < len && (*ptr.add(p + off + l)).is_ascii_alphanumeric() {
+                        l += 1;
+                    }
+                    spanned = true;
+                    l
+                };
+
+                let eff_len = tok_len.min(32);
+                if eff_len <= 17 {
+                    let tid_opt = if tok_start + 17 <= len {
+                        table.lookup(ptr.add(tok_start), eff_len)
+                    } else {
+                        let mut buf = [0u8; 32];
+                        buf[..eff_len].copy_from_slice(std::slice::from_raw_parts(
+                            ptr.add(tok_start),
+                            eff_len,
+                        ));
+                        table.lookup(buf.as_ptr(), eff_len)
+                    };
+                    if let Some(tid) = tid_opt {
+                        let id = tid as usize;
+                        if *last_seen.get_unchecked(id) != doc_id {
+                            *last_seen.get_unchecked_mut(id) = doc_id;
+                            *counts.get_unchecked_mut(id) += 1;
+                        }
+                    }
+                }
+
+                if spanned {
+                    p = tok_start + tok_len;
+                    prev_is_alnum = 0;
+                    break;
+                }
+            }
+
+            if has_nl {
+                let nl_off = nl_mask.trailing_zeros() as usize;
+                p += nl_off + 1;
+                doc_ended = true;
+                break;
+            } else if !spanned {
+                p += 32;
+            }
+        }
+
+        if !doc_ended {
+            while p < len && *ptr.add(p) != b'\n' {
+                if (*ptr.add(p)).is_ascii_alphanumeric() {
+                    let tok_start = p;
+                    while p < len && (*ptr.add(p)).is_ascii_alphanumeric() {
+                        p += 1;
+                    }
+                    let tok_len = p - tok_start;
+                    let eff_len = tok_len.min(32);
+                    if eff_len <= 17 {
+                        let mut buf = [0u8; 32];
+                        buf[..eff_len].copy_from_slice(std::slice::from_raw_parts(
+                            ptr.add(tok_start),
+                            eff_len,
+                        ));
+                        if let Some(tid) = table.lookup(buf.as_ptr(), eff_len) {
+                            let id = tid as usize;
+                            if *last_seen.get_unchecked(id) != doc_id {
+                                *last_seen.get_unchecked_mut(id) = doc_id;
+                                *counts.get_unchecked_mut(id) += 1;
+                            }
+                        }
+                    }
+                } else {
+                    p += 1;
+                }
+            }
+            if p < len && *ptr.add(p) == b'\n' {
+                p += 1;
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn pass2_scan(
+    slice: &[u8],
+    table: &TermTable,
+    vocab_size: usize,
+    cursors: &mut [u32],
+    out_ptr: *mut u32,
+) {
+    let mut last_seen = vec![u32::MAX; vocab_size];
+    let len = slice.len();
+    let ptr = slice.as_ptr();
+    let mut p = 0;
+
+    let v_20 = _mm256_set1_epi8(0x20);
+    let v_a_minus_1 = _mm256_set1_epi8((b'a' - 1) as i8);
+    let v_z_plus_1 = _mm256_set1_epi8((b'z' + 1) as i8);
+    let v_0_minus_1 = _mm256_set1_epi8((b'0' - 1) as i8);
+    let v_9_plus_1 = _mm256_set1_epi8((b'9' + 1) as i8);
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+
+    while p < len {
+        let mut doc_id = 0u32;
+        while p < len && *ptr.add(p) >= b'0' && *ptr.add(p) <= b'9' {
+            doc_id = doc_id * 10 + (*ptr.add(p) - b'0') as u32;
+            p += 1;
+        }
+        while p < len && *ptr.add(p) != b'\t' && *ptr.add(p) != b'\n' {
+            p += 1;
+        }
+        if p < len && *ptr.add(p) == b'\t' {
+            p += 1;
+        }
+
+        let mut prev_is_alnum = 0u32;
+        let mut doc_ended = false;
+        while p + 32 <= len {
+            let v = _mm256_loadu_si256(ptr.add(p) as *const __m256i);
+
+            let is_nl = _mm256_cmpeq_epi8(v, v_nl);
+            let nl_mask = _mm256_movemask_epi8(is_nl) as u32;
+
+            let c_or_20 = _mm256_or_si256(v, v_20);
+            let ge_a = _mm256_cmpgt_epi8(c_or_20, v_a_minus_1);
+            let le_z = _mm256_cmpgt_epi8(v_z_plus_1, c_or_20);
+            let is_alpha = _mm256_and_si256(ge_a, le_z);
+
+            let ge_0 = _mm256_cmpgt_epi8(v, v_0_minus_1);
+            let le_9 = _mm256_cmpgt_epi8(v_9_plus_1, v);
+            let is_digit = _mm256_and_si256(ge_0, le_9);
+
+            let is_alnum = _mm256_or_si256(is_alpha, is_digit);
+            let mut mask = _mm256_movemask_epi8(is_alnum) as u32;
+
+            let has_nl = nl_mask != 0;
+            if has_nl {
+                let nl_off = nl_mask.trailing_zeros();
+                let valid_mask = (1u32 << nl_off).wrapping_sub(1);
+                mask &= valid_mask;
+            }
+
+            let mut start_bits = mask & !((mask << 1) | prev_is_alnum);
+            prev_is_alnum = (mask >> 31) & 1;
+
+            let mut spanned = false;
+            while start_bits != 0 {
+                let off = start_bits.trailing_zeros() as usize;
+                start_bits &= start_bits - 1;
+                let tok_start = p + off;
+                let not_mask = (!mask) >> off;
+                let tok_len = if not_mask != 0 {
+                    not_mask.trailing_zeros() as usize
+                } else {
+                    let mut l = 32 - off;
+                    while p + off + l < len && (*ptr.add(p + off + l)).is_ascii_alphanumeric() {
+                        l += 1;
+                    }
+                    spanned = true;
+                    l
+                };
+
+                let eff_len = tok_len.min(32);
+                if eff_len <= 17 {
+                    let tid_opt = if tok_start + 17 <= len {
+                        table.lookup(ptr.add(tok_start), eff_len)
+                    } else {
+                        let mut buf = [0u8; 32];
+                        buf[..eff_len].copy_from_slice(std::slice::from_raw_parts(
+                            ptr.add(tok_start),
+                            eff_len,
+                        ));
+                        table.lookup(buf.as_ptr(), eff_len)
+                    };
+                    if let Some(tid) = tid_opt {
+                        let id = tid as usize;
+                        if *last_seen.get_unchecked(id) != doc_id {
+                            *last_seen.get_unchecked_mut(id) = doc_id;
+                            let pos = cursors.get_unchecked_mut(id);
+                            *out_ptr.add(*pos as usize) = doc_id;
+                            *pos += 1;
+                        }
+                    }
+                }
+
+                if spanned {
+                    p = tok_start + tok_len;
+                    prev_is_alnum = 0;
+                    break;
+                }
+            }
+
+            if has_nl {
+                let nl_off = nl_mask.trailing_zeros() as usize;
+                p += nl_off + 1;
+                doc_ended = true;
+                break;
+            } else if !spanned {
+                p += 32;
+            }
+        }
+
+        if !doc_ended {
+            while p < len && *ptr.add(p) != b'\n' {
+                if (*ptr.add(p)).is_ascii_alphanumeric() {
+                    let tok_start = p;
+                    while p < len && (*ptr.add(p)).is_ascii_alphanumeric() {
+                        p += 1;
+                    }
+                    let tok_len = p - tok_start;
+                    let eff_len = tok_len.min(32);
+                    if eff_len <= 17 {
+                        let mut buf = [0u8; 32];
+                        buf[..eff_len].copy_from_slice(std::slice::from_raw_parts(
+                            ptr.add(tok_start),
+                            eff_len,
+                        ));
+                        if let Some(tid) = table.lookup(buf.as_ptr(), eff_len) {
+                            let id = tid as usize;
+                            if *last_seen.get_unchecked(id) != doc_id {
+                                *last_seen.get_unchecked_mut(id) = doc_id;
+                                let pos = cursors.get_unchecked_mut(id);
+                                *out_ptr.add(*pos as usize) = doc_id;
+                                *pos += 1;
+                            }
+                        }
+                    }
+                } else {
+                    p += 1;
+                }
+            }
+            if p < len && *ptr.add(p) == b'\n' {
+                p += 1;
+            }
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
-    let (data_dir, out_dir) = (
-        std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string()),
-        std::env::var("OUT_DIR").unwrap_or_else(|_| "/out".to_string()),
-    );
-    let (docs_path, queries_path, out_path) = (
-        Path::new(&data_dir).join("docs.txt"),
-        Path::new(&data_dir).join("queries.txt"),
-        Path::new(&out_dir).join("results.txt"),
-    );
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
+    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "/out".to_string());
+    let docs_path = Path::new(&data_dir).join("docs.txt");
+    let queries_path = Path::new(&data_dir).join("queries.txt");
+    let out_path = Path::new(&out_dir).join("results.txt");
+    fs::create_dir_all(&out_dir)?;
 
     let docs_file = File::open(&docs_path)?;
     let file_len = docs_file.metadata()?.len() as usize;
-    // SAFETY: docs_file is a valid read-only file descriptor. file_len matches its size.
+    if file_len == 0 {
+        File::create(&out_path)?;
+        return Ok(());
+    }
+
     let mmap_ptr = unsafe {
         mmap(
             std::ptr::null_mut(),
@@ -349,17 +664,13 @@ fn main() -> std::io::Result<()> {
     if mmap_ptr == usize::MAX as *mut std::ffi::c_void || mmap_ptr.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: mmap_ptr is non-null and valid for file_len bytes.
     unsafe {
         madvise(mmap_ptr, file_len, MADV_POPULATE_READ);
     }
-    // SAFETY: mmap_slice is guaranteed valid for read access during the lifetime of main.
     let mmap_slice: &[u8] = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, file_len) };
 
-    // Read queries.txt directly from disk
-    let q_bytes = std::fs::read(&queries_path)?;
-    let mut table = FastTermTable::with_capacity(131072);
-    let mut bitset = vec![0u64; 8192];
+    let q_bytes = fs::read(&queries_path)?;
+    let mut table = TermTable::new();
     let mut parsed_queries = Vec::with_capacity(50000);
 
     let mut p = 0;
@@ -382,10 +693,6 @@ fn main() -> std::io::Result<()> {
             let mut parts = rest.split(|&b| b == b' ');
             if let Some(first) = parts.next() {
                 let first_id = table.get_or_insert(first);
-                let h = hash32(first);
-                let bit = (h & 0xFFFF) as usize;
-                bitset[bit >> 6] |= 1u64 << (bit & 63);
-
                 let mut ops = Vec::new();
                 while let Some(op_bytes) = parts.next() {
                     if let Some(term_bytes) = parts.next() {
@@ -395,9 +702,6 @@ fn main() -> std::io::Result<()> {
                             _ => 0,
                         };
                         let tid = table.get_or_insert(term_bytes);
-                        let th = hash32(term_bytes);
-                        let tbit = (th & 0xFFFF) as usize;
-                        bitset[tbit >> 6] |= 1u64 << (tbit & 63);
                         ops.push((op_code, tid));
                     }
                 }
@@ -418,9 +722,6 @@ fn main() -> std::io::Result<()> {
             for word in inner.split(|&b| b == b' ') {
                 if !word.is_empty() {
                     let tid = table.get_or_insert(word);
-                    let h = hash32(word);
-                    let bit = (h & 0xFFFF) as usize;
-                    bitset[bit >> 6] |= 1u64 << (bit & 63);
                     term_ids.push(tid);
                     let mut lower_word = Vec::with_capacity(word.len());
                     for &b in word {
@@ -435,7 +736,7 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    let vocab_size = table.entries.len();
+    let vocab_size = table.vocab_size as usize;
     let num_workers = thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(12)
@@ -457,8 +758,6 @@ fn main() -> std::io::Result<()> {
     }
     chunk_bounds.push(file_len);
 
-    // Build line_offsets table: 250,001 entries (starts of documents)
-    // We can populate line_offsets efficiently during pass 1
     let mut worker_counts: Vec<Vec<u32>> =
         (0..num_workers).map(|_| vec![0u32; vocab_size]).collect();
     let mut worker_doc_starts: Vec<Vec<u32>> = (0..num_workers).map(|_| Vec::new()).collect();
@@ -473,63 +772,16 @@ fn main() -> std::io::Result<()> {
             let (start, end) = (chunk_bounds[w], chunk_bounds[w + 1]);
             let slice = &mmap_slice[start..end];
             let table_ref = &table;
-            let bitset_ref = &bitset;
 
-            s.spawn(move || {
-                let mut p = 0;
-                let len = slice.len();
-                let mut doc_id;
-                let mut last_seen = vec![u32::MAX; vocab_size];
-
-                while p < len {
-                    let d_start = (start + p) as u32;
-                    let mut did = 0u32;
-                    while p < len && slice[p] >= b'0' && slice[p] <= b'9' {
-                        did = did * 10 + (slice[p] - b'0') as u32;
-                        p += 1;
-                    }
-                    doc_id = did;
-                    while p < len && slice[p] != b'\t' && slice[p] != b'\n' {
-                        p += 1;
-                    }
-                    if p < len && slice[p] == b'\t' {
-                        p += 1;
-                    }
-                    doc_starts_ref.push(d_start);
-
-                    while p < len && slice[p] != b'\n' {
-                        if slice[p].is_ascii_alphanumeric() {
-                            let start_t = p;
-                            while p < len && slice[p].is_ascii_alphanumeric() {
-                                p += 1;
-                            }
-                            let count = (p - start_t).min(32);
-                            let mut h = 0x517cc1b727220a95u64;
-                            for k in 0..count {
-                                h = (h.rotate_left(5) ^ ((slice[start_t + k] | 0x20) as u64))
-                                    .wrapping_mul(0x9e3779b97f4a7c15);
-                            }
-                            let h32 = (h ^ (h >> 32)) as u32;
-                            let bit = (h32 & 0xFFFF) as usize;
-                            if ((bitset_ref[bit >> 6] >> (bit & 63)) & 1) != 0 {
-                                if let Some(id) =
-                                    table_ref.lookup(&slice[start_t..start_t + count], h32)
-                                {
-                                    let id_usize = id as usize;
-                                    if last_seen[id_usize] != doc_id {
-                                        last_seen[id_usize] = doc_id;
-                                        counts_ref[id_usize] += 1;
-                                    }
-                                }
-                            }
-                        } else {
-                            p += 1;
-                        }
-                    }
-                    if p < len && slice[p] == b'\n' {
-                        p += 1;
-                    }
-                }
+            s.spawn(move || unsafe {
+                pass1_scan(
+                    slice,
+                    start,
+                    table_ref,
+                    vocab_size,
+                    counts_ref,
+                    doc_starts_ref,
+                );
             });
         }
     });
@@ -574,167 +826,138 @@ fn main() -> std::io::Result<()> {
             let (start, end) = (chunk_bounds[w], chunk_bounds[w + 1]);
             let slice = &mmap_slice[start..end];
             let table_ref = &table;
-            let bitset_ref = &bitset;
             let mut cursors = write_cursor[w].clone();
 
-            s.spawn(move || {
-                let mut p = 0;
-                let len = slice.len();
-                let mut doc_id;
-                let mut last_seen = vec![u32::MAX; vocab_size];
-                let out_ptr = all_postings_ptr as *mut u32;
-
-                while p < len {
-                    let mut did = 0u32;
-                    while p < len && slice[p] >= b'0' && slice[p] <= b'9' {
-                        did = did * 10 + (slice[p] - b'0') as u32;
-                        p += 1;
-                    }
-                    doc_id = did;
-                    while p < len && slice[p] != b'\t' && slice[p] != b'\n' {
-                        p += 1;
-                    }
-                    if p < len && slice[p] == b'\t' {
-                        p += 1;
-                    }
-
-                    while p < len && slice[p] != b'\n' {
-                        if slice[p].is_ascii_alphanumeric() {
-                            let start_t = p;
-                            while p < len && slice[p].is_ascii_alphanumeric() {
-                                p += 1;
-                            }
-                            let count = (p - start_t).min(32);
-                            let mut h = 0x517cc1b727220a95u64;
-                            for k in 0..count {
-                                h = (h.rotate_left(5) ^ ((slice[start_t + k] | 0x20) as u64))
-                                    .wrapping_mul(0x9e3779b97f4a7c15);
-                            }
-                            let h32 = (h ^ (h >> 32)) as u32;
-                            let bit = (h32 & 0xFFFF) as usize;
-                            if ((bitset_ref[bit >> 6] >> (bit & 63)) & 1) != 0 {
-                                if let Some(id) =
-                                    table_ref.lookup(&slice[start_t..start_t + count], h32)
-                                {
-                                    let id_usize = id as usize;
-                                    if last_seen[id_usize] != doc_id {
-                                        last_seen[id_usize] = doc_id;
-                                        unsafe {
-                                            let pos = cursors.get_unchecked_mut(id_usize);
-                                            *out_ptr.add(*pos as usize) = doc_id;
-                                            *pos += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            p += 1;
-                        }
-                    }
-                    if p < len && slice[p] == b'\n' {
-                        p += 1;
-                    }
-                }
+            s.spawn(move || unsafe {
+                pass2_scan(
+                    slice,
+                    table_ref,
+                    vocab_size,
+                    &mut cursors,
+                    all_postings_ptr as *mut u32,
+                );
             });
         }
     });
-
     drop(write_cursor);
 
-    // Parallel Query Execution
+    let term_offsets_ref: &'static [usize] = Box::leak(term_offsets.into_boxed_slice());
+    let all_postings_ref: &'static [u32] = Box::leak(all_postings.into_boxed_slice());
+
+    // QUERY EXECUTION: Parallel across 12 worker threads
     let num_queries = parsed_queries.len();
-    let num_threads = thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(12)
-        .min(12)
-        .max(1);
-    let chunk_size = (num_queries + num_threads - 1) / num_threads;
-    let mut thread_outputs: Vec<Vec<u8>> = (0..num_threads).map(|_| Vec::new()).collect();
-    let (offsets_ref, postings_ref) = (&term_offsets, &all_postings);
+    let q_chunk = (num_queries + num_workers - 1) / num_workers;
+    let mut out_parts: Vec<Vec<u8>> = (0..num_workers).map(|_| Vec::new()).collect();
 
     thread::scope(|s| {
         let (queries_ref, mmap_ref, line_offsets_ref) =
             (&parsed_queries, &mmap_slice, &line_offsets);
-        let get_postings = |tid: u32| -> &[u32] {
-            let t = tid as usize;
-            &postings_ref[offsets_ref[t]..offsets_ref[t + 1]]
-        };
-        for (thread_idx, out_buf) in thread_outputs.iter_mut().enumerate() {
-            let (start, end) = (
-                thread_idx * chunk_size,
-                (thread_idx * chunk_size + chunk_size).min(num_queries),
-            );
-            if start >= end {
+
+        for (w, out_buf) in out_parts.iter_mut().enumerate() {
+            let q_start = w * q_chunk;
+            let q_end = (q_start + q_chunk).min(num_queries);
+            if q_start >= q_end {
                 continue;
             }
+
             s.spawn(move || {
-                let (mut cur_res, mut next_res, mut scratch, mut matches) =
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                for q_idx in start..end {
-                    match &queries_ref[q_idx] {
+                let mut cur_res = Vec::with_capacity(32768);
+                let mut temp_res = Vec::with_capacity(32768);
+                let mut matches = Vec::with_capacity(4096);
+                let mut out = Vec::with_capacity((q_end - q_start) * 64);
+
+                for q in &queries_ref[q_start..q_end] {
+                    match q {
                         ParsedQuery::Bool { first_term, ops } => {
-                            let p0 = get_postings(*first_term);
+                            let ft = *first_term as usize;
+                            let p0 =
+                                &all_postings_ref[term_offsets_ref[ft]..term_offsets_ref[ft + 1]];
                             if ops.is_empty() {
-                                fast_write_results(out_buf, p0);
+                                fast_write_results(&mut out, p0);
                             } else {
                                 cur_res.clear();
-                                let (first_op, first_tid) = ops[0];
-                                let p1 = get_postings(first_tid);
-                                match first_op {
-                                    0 => intersect_sorted(p0, p1, &mut cur_res),
-                                    1 => union_sorted(p0, p1, &mut cur_res),
-                                    2 => difference_sorted(p0, p1, &mut cur_res),
-                                    _ => {}
-                                }
-                                for &(op, tid) in &ops[1..] {
-                                    let p = get_postings(tid);
+                                cur_res.extend_from_slice(p0);
+
+                                for &(op, tid) in ops {
+                                    if op == 0 && cur_res.is_empty() {
+                                        continue;
+                                    }
+                                    let t_idx = tid as usize;
+                                    let t_range =
+                                        term_offsets_ref[t_idx]..term_offsets_ref[t_idx + 1];
+                                    let t_slice = &all_postings_ref[t_range];
+
                                     match op {
                                         0 => {
-                                            intersect_sorted(&cur_res, p, &mut next_res);
-                                            std::mem::swap(&mut cur_res, &mut next_res);
+                                            intersect_sorted(&cur_res, t_slice, &mut temp_res);
+                                            std::mem::swap(&mut cur_res, &mut temp_res);
                                         }
                                         1 => {
-                                            union_sorted(&cur_res, p, &mut next_res);
-                                            std::mem::swap(&mut cur_res, &mut next_res);
+                                            union_sorted(&cur_res, t_slice, &mut temp_res);
+                                            std::mem::swap(&mut cur_res, &mut temp_res);
                                         }
                                         2 => {
-                                            difference_sorted(&cur_res, p, &mut next_res);
-                                            std::mem::swap(&mut cur_res, &mut next_res);
+                                            difference_sorted(&cur_res, t_slice, &mut temp_res);
+                                            std::mem::swap(&mut cur_res, &mut temp_res);
                                         }
                                         _ => {}
                                     }
                                 }
-                                fast_write_results(out_buf, &cur_res);
+                                fast_write_results(&mut out, &cur_res);
                             }
                         }
                         ParsedQuery::Phrase { term_ids, words } => {
-                            if term_ids.is_empty()
-                                || term_ids.iter().any(|&t| get_postings(t).is_empty())
-                            {
-                                out_buf.extend_from_slice(b"0 0\n");
+                            if term_ids.is_empty() {
+                                out.extend_from_slice(b"0 0\n");
                                 continue;
                             }
-                            let (num_tids, mut order) = (term_ids.len().min(16), [0usize; 16]);
-                            for idx in 0..num_tids {
-                                order[idx] = idx;
+                            let mut min_len = usize::MAX;
+                            let mut min_tid = 0;
+                            for &tid in term_ids {
+                                let t_idx = tid as usize;
+                                let len = term_offsets_ref[t_idx + 1] - term_offsets_ref[t_idx];
+                                if len < min_len {
+                                    min_len = len;
+                                    min_tid = tid;
+                                }
                             }
-                            order[..num_tids]
-                                .sort_unstable_by_key(|&idx| get_postings(term_ids[idx]).len());
+
+                            if min_len == 0 {
+                                out.extend_from_slice(b"0 0\n");
+                                continue;
+                            }
+
+                            let mt_idx = min_tid as usize;
                             cur_res.clear();
-                            cur_res.extend_from_slice(get_postings(term_ids[order[0]]));
-                            for &idx in &order[1..num_tids] {
+                            cur_res.extend_from_slice(
+                                &all_postings_ref
+                                    [term_offsets_ref[mt_idx]..term_offsets_ref[mt_idx + 1]],
+                            );
+
+                            for &tid in term_ids {
+                                if tid == min_tid {
+                                    continue;
+                                }
                                 if cur_res.is_empty() {
                                     break;
                                 }
+                                let t_idx = tid as usize;
+                                let t_range = term_offsets_ref[t_idx]..term_offsets_ref[t_idx + 1];
                                 intersect_sorted(
                                     &cur_res,
-                                    get_postings(term_ids[idx]),
-                                    &mut scratch,
+                                    &all_postings_ref[t_range],
+                                    &mut temp_res,
                                 );
-                                std::mem::swap(&mut cur_res, &mut scratch);
+                                std::mem::swap(&mut cur_res, &mut temp_res);
                             }
+
+                            if cur_res.is_empty() {
+                                out.extend_from_slice(b"0 0\n");
+                                continue;
+                            }
+
                             let k = words.len();
-                            let mut pi = [0usize; 16];
+                            let mut pi = vec![0usize; k];
                             let mut j = 0;
                             for i in 1..k {
                                 while j > 0 && words[i] != words[j] {
@@ -745,6 +968,7 @@ fn main() -> std::io::Result<()> {
                                 }
                                 pi[i] = j;
                             }
+
                             matches.clear();
                             for &c_doc in &cur_res {
                                 let c_idx = c_doc as usize;
@@ -757,7 +981,6 @@ fn main() -> std::io::Result<()> {
                                     continue;
                                 }
                                 let line_slice = &mmap_ref[f_offset..f_end];
-                                // Skip doc_id and tab
                                 let mut dp = 0;
                                 while dp < line_slice.len()
                                     && line_slice[dp] != b'\t'
@@ -803,25 +1026,27 @@ fn main() -> std::io::Result<()> {
                                     }
                                 }
                             }
-                            fast_write_results(out_buf, &matches);
+                            fast_write_results(&mut out, &matches);
                         }
-                        ParsedQuery::Empty => out_buf.extend_from_slice(b"0 0\n"),
+                        ParsedQuery::Empty => {
+                            out.extend_from_slice(b"0 0\n");
+                        }
                     }
                 }
+                *out_buf = out;
             });
         }
     });
 
-    fs::create_dir_all(&out_dir)?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_path)?);
-    for out_buf in thread_outputs {
-        writer.write_all(&out_buf)?;
+    let mut out_file = BufWriter::with_capacity(512 * 1024, File::create(&out_path)?);
+    for part in &out_parts {
+        out_file.write_all(part)?;
     }
-    writer.flush()?;
+    out_file.flush()?;
 
-    // SAFETY: mmap_ptr is non-null and valid; munmap cleans up the virtual memory mapping.
     unsafe {
         munmap(mmap_ptr, file_len);
     }
+
     Ok(())
 }

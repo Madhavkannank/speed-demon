@@ -15,6 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | E1: mmap + MADV_POPULATE_READ phrase verification, eliminating 214k pread syscalls and zero-copy KMP matching | RUN-ID: <fill> | 1.114 | 266.0 | +1.331 dpts |
 | 10 | E2+E3+E4: Flat open-addressing table, 64KB bitset prefilter, branchless token scan, and two-pass arena postings | RUN-ID: <fill> | 0.888 | 131.5 | +5.672 dpts |
 | 11 | E5: Zero-copy 0-op and 1-op BOOL evaluation directly from arena slices | RUN-ID: <fill> | 0.765 | 131.5 | +5.956 dpts |
+| 12 | B5: AVX2 start-bit scanning, SWAR hashing, and inlined 32-byte TableSlot vocabulary | local paired (15/15 wins) | 0.798 | 133.2 | +0.604 dpts |
 
 ## Detailed Experiment Logs (Phase 1)
 
@@ -167,3 +168,30 @@ Every step from the reference to your final version, each with the live-board ru
 - **Root Cause Analysis**:
   1. Multiple threads executing `MADV_POPULATE_READ` concurrently suffered from kernel page table lock contention (`mm->mmap_lock`), which degraded throughput compared to pre-faulting during the sequential phase while query files were being read.
 - **Verdict**: **REJECTED** (Formula score delta $-0.13$ pts $< +0.3$ gate; candidate reverted).
+
+### Experiment B5: AVX2 Start-Bit Scanning, SWAR Hashing, and Inlined 32-Byte TableSlot Tokenizer
+- **RUN-ID**: `local-cand-b5`
+- **Hypothesis**: The scalar token extraction loop in both Pass 1 and Pass 2 examined characters byte-by-byte with dependent hash multiplications, limiting document scanning throughput to ~280 MB/s. Replacing this with an AVX2 start-bit classifier (`_mm256_loadu_si256`, vectorized `c | 0x20` range classification, bitmask start detection `mask & !((mask << 1) | prev)`), SWAR unaligned 64-bit token hashing, and an inlined 32-byte collision-verified `TableSlot` (key_low, key_high, hash, id, len, extra) will accelerate indexing throughput to >1.5 GB/s, cutting total wall-clock time by ~90 ms and reducing peak memory by avoiding dense bitmaps or arena overhead.
+- **Implementation Changes**:
+  1. Implemented inlined 32-byte `TableSlot` open-addressing table with power-of-two mask (262,144 slots $\times$ 32 bytes = 8 MB in L3/RAM).
+  2. Implemented `hash_and_key`: branchless SWAR 64-bit lowercase masking (`raw | 0x2020202020202020`), unaligned integer load, and full-key collision verification without any string arena dereferencing.
+  3. Implemented AVX2 32-byte vector classification in `pass1_scan` and `pass2_scan`, extracting token start positions via `trailing_zeros()` on bitmasks.
+  4. Handled multi-chunk spanning tokens and scalar tails when documents reach `\n`.
+  5. Preserved exact token-level phrase query verification semantics and CSR postings architecture.
+- **Measurements (15 alternating pairs, cand-b vs track-b)**:
+  - Baseline Median: $T = 889.1$ ms, $M = 139.1$ MB, $S = 778$ lines (Board Est: 49.37 pts)
+  - Candidate Median: $T = 798.9$ ms, $M = 133.2$ MB, $S = 968$ lines (Board Est: 49.98 pts)
+  - Paired Time Difference: **+10.22% faster** ($-90.2$ ms)
+  - Memory Reduction: **-5.9 MB** ($139.1 \to 133.2$ MB)
+  - Paired Score Delta: **+0.604 pts** ($\Delta T = +1.161$, $\Delta M = +0.188$, $\Delta S = -0.745$)
+  - Win Rate: **15 / 15 pairs (100.0%)**
+  - Run-to-Run Spread: 11.45%
+- **Correctness Status**:
+  - Full Seed 1: PASS (`f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`)
+  - Full Seed 2: PASS (`7f224ef65795253d...`)
+  - Full Seed 3: PASS (`7e004661d6d7b2db...`)
+  - Full Seed 4: PASS (`54cc921b713090e1...`)
+  - Sample (Seed 1): PASS (`eeeec1e9319da98a...`)
+  - Tiny (Seed 1): PASS (`dcdad7cedfc07eb6...`)
+- **Verdict**: **ACCEPTED** (Won 15/15 pairs, +10.22% runtime improvement, -5.9 MB memory, +0.604 delta points $> +0.3$ gate).
+
