@@ -1,4 +1,11 @@
-use std::{fs::File, io::Write, os::unix::fs::FileExt, thread};
+use std::{
+    fs::File,
+    io::Write,
+    os::unix::fs::FileExt,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    thread,
+};
+
 #[inline(always)]
 fn get_hour_str(h: usize) -> [u8; 20] {
     let (d, hr) = match h {
@@ -17,6 +24,7 @@ fn get_hour_str(h: usize) -> [u8; 20] {
     out[12] = b'0' + (hr % 10) as u8;
     out
 }
+
 #[inline(always)]
 fn get_hour_idx(ts: &[u8]) -> usize {
     let (d, h) = (
@@ -30,6 +38,7 @@ fn get_hour_idx(ts: &[u8]) -> usize {
         _ => 54 + h,
     }
 }
+
 #[inline(always)]
 fn write_u32(buf: &mut Vec<u8>, mut n: u32) {
     if n == 0 {
@@ -45,35 +54,18 @@ fn write_u32(buf: &mut Vec<u8>, mut n: u32) {
     }
     buf.extend_from_slice(&b[i..]);
 }
-#[inline(always)]
-fn fast_hash(b: &[u8]) -> u32 {
-    let mut h = 0x517cc1b7u32;
-    let mut p = 0;
-    let len = b.len();
-    while p + 8 <= len {
-        let w = unsafe { (b.as_ptr().add(p) as *const u64).read_unaligned() };
-        h = (h.rotate_left(7) ^ (w as u32) ^ ((w >> 32) as u32)).wrapping_mul(0x27220a95);
-        p += 8;
-    }
-    if p < len {
-        let mut rem = [0u8; 8];
-        rem[..len - p].copy_from_slice(&b[p..]);
-        let w = u64::from_le_bytes(rem);
-        h = (h.rotate_left(7) ^ (w as u32) ^ ((w >> 32) as u32)).wrapping_mul(0x27220a95);
-    }
-    (h ^ ((len as u32).wrapping_mul(0x9e3779b9))).wrapping_mul(0x27220a95)
+
+struct AtomicSlot {
+    hash_len: AtomicU64,
+    id: AtomicU32,
 }
-#[derive(Clone, Copy)]
-struct HashSlot {
-    hash: u32,
-    len: u16,
-    id: u16,
-}
+
 #[derive(Clone, Copy)]
 struct GroupEntry {
     stat: u32,
     head: u32,
 }
+
 #[derive(Clone, Copy)]
 struct LatChunk {
     lats: [u32; 14],
@@ -81,6 +73,7 @@ struct LatChunk {
     _pad: [u8; 3],
     next: u32,
 }
+
 const TABLE_SIZE: usize = 4096;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
 const NUM_WORKERS: usize = 12;
@@ -92,6 +85,7 @@ struct WorkerOutput {
     slabs: [Option<Box<[GroupEntry; SLAB_LEN]>>; NUM_HOURS],
     chunks: Vec<LatChunk>,
 }
+
 fn main() -> std::io::Result<()> {
     let (data_dir, out_dir) = (
         std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string()),
@@ -107,101 +101,7 @@ fn main() -> std::io::Result<()> {
         File::create(&out_path)?;
         return Ok(());
     }
-    let mut probe_table = vec![
-        HashSlot {
-            hash: 0,
-            len: 0,
-            id: 0
-        };
-        TABLE_SIZE
-    ];
-    let mut ep_strings: Vec<Vec<u8>> = Vec::with_capacity(2048);
-    let (mut s_buf, mut s_offset, mut s_rem) = (vec![0u8; 128 * 1024 + 512], 0u64, 0);
-    while ep_strings.len() < 1842 && s_offset < file_len as u64 {
-        let to_read = (128 * 1024).min(file_len - s_offset as usize);
-        file.read_exact_at(&mut s_buf[s_rem..s_rem + to_read], s_offset)?;
-        s_offset += to_read as u64;
-        let avail = s_rem + to_read;
-        let mut last_nl = avail;
-        while last_nl > 0 && s_buf[last_nl - 1] != b'\n' {
-            last_nl -= 1;
-        }
-        let mut pos = 0;
-        while pos + 35 <= last_nl {
-            let mut idx = pos + 28;
-            while idx < last_nl && s_buf[idx] != b' ' {
-                idx += 1;
-            }
-            let ep_start = idx + 1;
-            idx = ep_start;
-            while idx < last_nl && s_buf[idx] != b' ' {
-                idx += 1;
-            }
-            let ep_slice = &s_buf[ep_start..idx];
-            let h = fast_hash(ep_slice);
-            let mut slot = (h as usize) & TABLE_MASK;
-            loop {
-                let e = &probe_table[slot];
-                if e.hash == h
-                    && e.len as usize == ep_slice.len()
-                    && ep_strings[e.id as usize] == ep_slice
-                {
-                    break;
-                }
-                if e.len == 0 {
-                    let id = ep_strings.len() as u16;
-                    probe_table[slot] = HashSlot {
-                        hash: h,
-                        len: ep_slice.len() as u16,
-                        id,
-                    };
-                    ep_strings.push(ep_slice.to_vec());
-                    break;
-                }
-                slot = (slot + 1) & TABLE_MASK;
-            }
-            if ep_strings.len() == 1842 {
-                break;
-            }
-            while idx < last_nl && s_buf[idx] != b'\n' {
-                idx += 1;
-            }
-            pos = idx + 1;
-        }
-        s_rem = avail - last_nl;
-        if s_rem > 0 {
-            s_buf.copy_within(last_nl..avail, 0);
-        }
-    }
-    drop(s_buf);
-    drop(probe_table);
-    ep_strings.sort_unstable();
-    let _num_eps = ep_strings.len();
-    let mut ep_table = vec![
-        HashSlot {
-            hash: 0,
-            len: 0,
-            id: 0
-        };
-        TABLE_SIZE
-    ];
-    for (i, ep) in ep_strings.iter().enumerate() {
-        let h = fast_hash(ep);
-        let mut slot = (h as usize) & TABLE_MASK;
-        loop {
-            if ep_table[slot].len == 0 {
-                ep_table[slot] = HashSlot {
-                    hash: h,
-                    len: ep.len() as u16,
-                    id: i as u16,
-                };
-                break;
-            }
-            slot = (slot + 1) & TABLE_MASK;
-        }
-    }
-    let ep_table_ref: &'static [HashSlot] = Box::leak(ep_table.into_boxed_slice());
-    let ep_strings_ref: &'static [Vec<u8>] = Box::leak(ep_strings.into_boxed_slice());
+
     let (approx_chunk, mut chunk_bounds) =
         (file_len / NUM_WORKERS, Vec::with_capacity(NUM_WORKERS + 1));
     chunk_bounds.push(0);
@@ -217,6 +117,23 @@ fn main() -> std::io::Result<()> {
     }
     chunk_bounds.push(file_len);
     drop(scan_buf);
+
+    let mut table_vec = Vec::with_capacity(TABLE_SIZE);
+    for _ in 0..TABLE_SIZE {
+        table_vec.push(AtomicSlot {
+            hash_len: AtomicU64::new(0),
+            id: AtomicU32::new(u32::MAX),
+        });
+    }
+    let table_ref: &'static [AtomicSlot] = Box::leak(table_vec.into_boxed_slice());
+    let next_id: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+    let mut ep_storage: Vec<Vec<u8>> = (0..2048).map(|_| Vec::new()).collect();
+    let ep_storage_ptrs: Vec<usize> = ep_storage
+        .iter_mut()
+        .map(|v| v as *mut Vec<u8> as usize)
+        .collect();
+    let ep_storage_ptrs_ref: &'static [usize] = Box::leak(ep_storage_ptrs.into_boxed_slice());
+
     let mut handles = Vec::with_capacity(NUM_WORKERS);
     for i in 0..NUM_WORKERS {
         let (start_pos, end_pos, path) = (chunk_bounds[i], chunk_bounds[i + 1], input_path.clone());
@@ -229,6 +146,8 @@ fn main() -> std::io::Result<()> {
                 let mut chunks = Vec::with_capacity(29_000);
                 let (mut buf, mut cur_offset, mut rem_len) =
                     (vec![0u8; CHUNK_SIZE + 4096], start_pos, 0);
+                let mut local_cache = [(0u64, 0u32); 1024];
+
                 while cur_offset < end_pos || rem_len > 0 {
                     let to_read = (CHUNK_SIZE).min(end_pos.saturating_sub(cur_offset));
                     let read_bytes = if to_read > 0 {
@@ -311,17 +230,57 @@ fn main() -> std::io::Result<()> {
                         let ep_len = idx - ep_start;
                         h = (h ^ ((ep_len as u32).wrapping_mul(0x9e3779b9)))
                             .wrapping_mul(0x27220a95);
-                        let mut slot = (h as usize) & TABLE_MASK;
-                        let ep_id = loop {
-                            let entry = &ep_table_ref[slot];
-                            if entry.hash == h
-                                && entry.len as usize == ep_len
-                                && ep_strings_ref[entry.id as usize] == &slice[ep_start..idx]
-                            {
-                                break entry.id as usize;
-                            }
-                            slot = (slot + 1) & TABLE_MASK;
+                        let hl = ((h as u64) << 32) | (ep_len as u64);
+                        let ep_slice = &slice[ep_start..idx];
+
+                        let cache_slot = (h as usize) & 1023;
+                        let (c_hl, c_id) = local_cache[cache_slot];
+                        let ep_id = if c_hl == hl {
+                            c_id as usize
+                        } else {
+                            let mut slot = (h as usize) & TABLE_MASK;
+                            let id = loop {
+                                let s = &table_ref[slot];
+                                let curr_hl = s.hash_len.load(Ordering::Relaxed);
+                                if curr_hl == hl {
+                                    while s.id.load(Ordering::Relaxed) == u32::MAX {
+                                        std::hint::spin_loop();
+                                    }
+                                    let cand_id = s.id.load(Ordering::Acquire);
+                                    let cand_ep = unsafe {
+                                        &*(ep_storage_ptrs_ref[cand_id as usize] as *const Vec<u8>)
+                                    };
+                                    if cand_ep == ep_slice {
+                                        break cand_id;
+                                    }
+                                }
+                                if curr_hl == 0 {
+                                    if s.hash_len
+                                        .compare_exchange_weak(
+                                            0,
+                                            hl,
+                                            Ordering::AcqRel,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        let new_id = next_id.fetch_add(1, Ordering::Relaxed);
+                                        let ep_vec = unsafe {
+                                            &mut *(ep_storage_ptrs_ref[new_id as usize]
+                                                as *mut Vec<u8>)
+                                        };
+                                        *ep_vec = ep_slice.to_vec();
+                                        s.id.store(new_id, Ordering::Release);
+                                        break new_id;
+                                    }
+                                    continue;
+                                }
+                                slot = (slot + 1) & TABLE_MASK;
+                            };
+                            local_cache[cache_slot] = (hl, id);
+                            id as usize
                         };
+
                         let is_5xx = (slice[idx + 1] == b'5') as u32;
                         let mut p = idx + 5;
                         let mut lat = (slice[p] - b'0') as u32;
@@ -380,6 +339,13 @@ fn main() -> std::io::Result<()> {
     }
     let workers: Vec<WorkerOutput> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let workers_ref: &'static [WorkerOutput] = Box::leak(workers.into_boxed_slice());
+
+    let num_eps = next_id.load(Ordering::Relaxed) as usize;
+    let mut perm: Vec<usize> = (0..num_eps).collect();
+    perm.sort_unstable_by(|&a, &b| ep_storage[a].cmp(&ep_storage[b]));
+    let perm_ref: &'static [usize] = Box::leak(perm.into_boxed_slice());
+    let ep_storage_ref: &'static [Vec<u8>] = Box::leak(ep_storage.into_boxed_slice());
+
     let out_handles: Vec<_> = (0..12)
         .map(|t| {
             thread::Builder::new()
@@ -397,7 +363,8 @@ fn main() -> std::io::Result<()> {
                         if active_w.is_empty() {
                             continue;
                         }
-                        for (ep_id, ep) in ep_strings_ref.iter().enumerate() {
+                        for &ep_id in perm_ref.iter() {
+                            let ep = &ep_storage_ref[ep_id];
                             let (mut count, mut errors) = (0u32, 0u32);
                             for w in &active_w {
                                 let g = &w.slabs[hour_idx].as_ref().unwrap()[ep_id];

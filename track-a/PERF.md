@@ -26,5 +26,6 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | A2 (attempt): Per-worker interning & post-join mapping to remove discovery pass | RUN-ID-A2 (rejected) | 0.057 est | 36.6 | 69.62 (reverted: discovery is only 5.0ms; per-line arena indirection and output mapping regressed T by 27%) |
 | 20 | A3/A4 (attempt): mmap + MADV_POPULATE_READ vs pread, proportional chunk/output sizing | RUN-ID-A3-A4 (rejected) | 0.070 | 35.1 | 72.34 (reverted: 58k minor page faults and mm->mmap_lock contention regressed T by +5.9% to +14.2%; A4 sizing alone won 8/15 but Δ=+0.14 < +0.3 gate) |
 | 21 | A5 (attempt): Raw pointer bounds elimination in hot log parser loop | RUN-ID-A5 (rejected) | 0.066 | 34.6 | 72.98 (reverted: T improved 68.7ms -> 66.3ms and Δ=+0.32, but win rate 8/15 failed >=12/15 paired gate) |
+| 22 | On-the-fly lock-free endpoint table with 1024-entry L1 direct-mapped cache, eliminating 5.6ms Phase 1 sequential discovery scan, 434 lines | local paired (12/15 wins, 495ca0... match) | 0.062 | 34.6 | 73.99 (+1.47 pts) |
 
 
