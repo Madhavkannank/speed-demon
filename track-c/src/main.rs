@@ -63,6 +63,9 @@ fn load_regions(path: &Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
             reg_id = reg_id * 10 + (bytes[p] - b'0') as usize;
             p += 1;
         }
+        if reg_id >= region_map.len() {
+            region_map.resize(reg_id + 1, 0);
+        }
         if p < len && bytes[p] == b',' {
             p += 1;
         }
@@ -149,41 +152,57 @@ fn main() -> std::io::Result<()> {
     let approx_chunk = (file_len - header_offset) / NUM_WORKERS;
     let mut chunk_bounds = Vec::with_capacity(NUM_WORKERS + 1);
     chunk_bounds.push(header_offset);
-    let mut scan_buf = vec![0u8; 4096];
+    let mut scan_buf = vec![0u8; 65536];
     for i in 1..NUM_WORKERS {
-        let approx_pos = header_offset + i * approx_chunk;
-        file.read_exact_at(&mut scan_buf, approx_pos as u64)?;
+        let mut cur_search = header_offset + i * approx_chunk;
         let mut found_pos = None;
-        let mut p = 0;
-        while p + 16 < scan_buf.len() {
-            if scan_buf[p] == b'.'
-                && scan_buf[p + 1].is_ascii_digit()
-                && scan_buf[p + 2].is_ascii_digit()
+        while cur_search < file_len && found_pos.is_none() {
+            let to_read = scan_buf.len().min(file_len - cur_search);
+            if file
+                .read_exact_at(&mut scan_buf[..to_read], cur_search as u64)
+                .is_err()
             {
-                let mut after = p + 3;
-                if scan_buf[after] == b'\r' {
-                    after += 1;
-                }
-                if scan_buf[after] == b'\n' {
-                    let mut rec_start = after + 1;
-                    if scan_buf[rec_start..].starts_with(b"\xef\xbb\xbf") {
-                        rec_start += 3;
-                    }
-                    if scan_buf[rec_start].is_ascii_digit() && scan_buf[rec_start] != b'0' {
-                        let mut d = rec_start + 1;
-                        while d < scan_buf.len() && scan_buf[d].is_ascii_digit() {
-                            d += 1;
-                        }
-                        if d < scan_buf.len() && scan_buf[d] == b',' {
-                            found_pos = Some(approx_pos + rec_start);
-                            break;
-                        }
-                    }
-                }
+                break;
             }
-            p += 1;
+            let mut p = 0;
+            while p + 16 < to_read {
+                if scan_buf[p] == b'.'
+                    && scan_buf[p + 1].is_ascii_digit()
+                    && scan_buf[p + 2].is_ascii_digit()
+                {
+                    let mut after = p + 3;
+                    if after < to_read && scan_buf[after] == b'\r' {
+                        after += 1;
+                    }
+                    if after < to_read && scan_buf[after] == b'\n' {
+                        let mut rec_start = after + 1;
+                        if rec_start + 3 <= to_read
+                            && scan_buf[rec_start..].starts_with(b"\xef\xbb\xbf")
+                        {
+                            rec_start += 3;
+                        }
+                        if rec_start < to_read
+                            && scan_buf[rec_start].is_ascii_digit()
+                            && scan_buf[rec_start] != b'0'
+                        {
+                            let mut d = rec_start + 1;
+                            while d < to_read && scan_buf[d].is_ascii_digit() {
+                                d += 1;
+                            }
+                            if d < to_read && scan_buf[d] == b',' {
+                                found_pos = Some(cur_search + rec_start);
+                                break;
+                            }
+                        }
+                    }
+                }
+                p += 1;
+            }
+            if found_pos.is_none() {
+                cur_search += to_read.saturating_sub(64);
+            }
         }
-        chunk_bounds.push(found_pos.unwrap_or(approx_pos));
+        chunk_bounds.push(found_pos.unwrap_or(file_len));
     }
     chunk_bounds.push(file_len);
     drop(scan_buf);
@@ -410,7 +429,7 @@ fn main() -> std::io::Result<()> {
                             }
                         }
 
-                        let c_id = if reg_id < 1_000_000 {
+                        let c_id = if reg_id < region_map_ref.len() {
                             region_map_ref[reg_id] as usize
                         } else {
                             0

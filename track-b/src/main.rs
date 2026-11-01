@@ -69,8 +69,34 @@ impl FastTermTable {
         }
     }
 
+    fn resize(&mut self) {
+        let new_cap = self.slots.len() * 2;
+        let new_mask = new_cap - 1;
+        let mut new_slots = vec![
+            TableSlot {
+                tag: u32::MAX,
+                id: u32::MAX,
+            };
+            new_cap
+        ];
+        for &slot in &self.slots {
+            if slot.tag != u32::MAX {
+                let mut idx = (slot.tag as usize) & new_mask;
+                while new_slots[idx].tag != u32::MAX {
+                    idx = (idx + 1) & new_mask;
+                }
+                new_slots[idx] = slot;
+            }
+        }
+        self.slots = new_slots;
+        self.mask = new_mask;
+    }
+
     #[inline(always)]
     fn get_or_insert(&mut self, term: &[u8]) -> u32 {
+        if self.entries.len() * 2 >= self.slots.len() {
+            self.resize();
+        }
         let h = hash32(term);
         let tag = if h == u32::MAX { 0 } else { h };
         let mut idx = (tag as usize) & self.mask;

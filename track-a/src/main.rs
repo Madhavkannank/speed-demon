@@ -142,7 +142,10 @@ fn main() -> std::io::Result<()> {
             let mut slot = (h as usize) & TABLE_MASK;
             loop {
                 let e = &probe_table[slot];
-                if e.hash == h && e.len as usize == ep_slice.len() {
+                if e.hash == h
+                    && e.len as usize == ep_slice.len()
+                    && ep_strings[e.id as usize] == ep_slice
+                {
                     break;
                 }
                 if e.len == 0 {
@@ -311,7 +314,10 @@ fn main() -> std::io::Result<()> {
                         let mut slot = (h as usize) & TABLE_MASK;
                         let ep_id = loop {
                             let entry = &ep_table_ref[slot];
-                            if entry.hash == h && entry.len as usize == ep_len {
+                            if entry.hash == h
+                                && entry.len as usize == ep_len
+                                && ep_strings_ref[entry.id as usize] == &slice[ep_start..idx]
+                            {
                                 break entry.id as usize;
                             }
                             slot = (slot + 1) & TABLE_MASK;
