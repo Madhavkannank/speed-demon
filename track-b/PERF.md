@@ -116,5 +116,54 @@ Every step from the reference to your final version, each with the live-board ru
   - Sample (Seeds 2, 3, 4): PASS (100% byte-exact match against Python reference implementation)
   - Worked example & edge cases: PASS verbatim
 - **Verdict**: **ACCEPTED** (Won 15/15 pairs on both 0-7 and 0-11, +25.97% time improvement, -153.1 MB peak memory, +5.956 delta points).
-
-
+### Experiment B1 + B2: SWAR Token Hashing and Dense Bitmaps for High-DF Terms
+- **RUN-ID**: `local-cand-b1-b2`
+- **Hypothesis**: Replacing byte-by-byte token hashing with SWAR unaligned 8-byte loading and expanding the query filter bitset to 128 KB ($2^{20}$ bits) would reduce token table probes by 90%. Storing terms with $df > N/32$ (~7,812 docs) in dense 31 KB doc bitsets would accelerate boolean and phrase set operations via $O(1)$ bit checking (`retain`).
+- **Implementation Changes**:
+  1. Expanded bloom filter bitset from 64 KB to 128 KB ($2^{20}$ bits).
+  2. Implemented `fast_hash` SWAR unaligned 64-bit load with `0x20` masking.
+  3. Identified terms with $df > 7812$ in Pass 1 and populated 31.25 KB bitsets for high-df terms.
+  4. Used dense bitset testing in `BOOL` and `PHRASE` query evaluation.
+  5. Refactored lines so $S = 745$ lines (under 750 cap).
+- **Measurements (CPUs 0-7, 15 alternating pairs)**:
+  - Baseline Median: $T = 905.3$ ms, $M = 139.1$ MB, $S = 778$ lines (Board Est: 49.17 pts)
+  - Candidate Median: $T = 984.6$ ms, $M = 158.5$ MB, $S = 745$ lines (Board Est: 47.84 pts, $-1.34$ pts)
+  - Paired Median Improvement: **-7.18% (slower)**
+  - Peak RAM: **+19.4 MB** (139.1 MB $\to$ 158.5 MB)
+  - Candidate Win Rate: **0 / 15 pairs (0.0%)**
+  - All Hashes Byte-Exact: PASS (100% exact match across all scales and seeds 1-4)
+- **Root Cause Analysis**:
+  1. Maintaining both `all_postings` and `dense_bitsets` caused memory duplication: dense postings were stored in both `all_postings` and the 11.3 MB bitset array, inflating peak RSS by +19.4 MB.
+  2. In query evaluation, testing scattered document IDs against a 31 KB bitset via `retain(|&d| ((d_bits[d >> 6] >> (d & 63)) & 1) != 0)` caused non-contiguous memory accesses and L1/L2 cache misses, whereas baseline `intersect_sorted` operates on contiguous sequential slices that stream with hardware prefetchers.
+### Experiment B3: SWAR Word Matching in Phrase Candidate Verification
+- **RUN-ID**: `local-cand-b3`
+- **Hypothesis**: For phrase queries, candidate document verification was comparing characters byte-by-byte in `matches_word`. Precomputing 64-bit masked target words and checking `((raw | 0x2020202020202020) & mask) == target_u64` was hypothesized to accelerate candidate verification.
+- **Implementation Changes**:
+  1. Precomputed `target_u64` and `target_masks` for words of length $\le 8$ in `ParsedQuery::Phrase`.
+  2. In `matches_word`, used unaligned 64-bit load and mask for short words.
+  3. Replaced tab-seeking while loop with `position(|&b| b == b'\t')`.
+- **Measurements (CPUs 0-7, 15 alternating pairs)**:
+  - Baseline Median: $T = 898.9$ ms, $M = 139.2$ MB, $S = 778$ lines (Board Est: 49.25 pts)
+  - Candidate Median: $T = 908.6$ ms, $M = 139.1$ MB, $S = 788$ lines (Board Est: 49.09 pts, $-0.15$ pts)
+  - Paired Median Improvement: **-1.09%**
+  - Candidate Win Rate: 3 / 15 pairs (20.0%)
+  - All Hashes Byte-Exact: PASS (100% exact match across all scales and seeds 1-4)
+- **Root Cause Analysis**:
+  1. The per-query precomputation loop over `words` and branch checks inside the candidate matching loop added overhead that outweighed the single-word SWAR compare savings.
+  2. The LLVM compiler was already unrolling and auto-vectorizing the small fixed-size word slices effectively in the baseline.
+### Experiment B4: Serial Startup Elimination (Parallel madvise)
+- **RUN-ID**: `local-cand-b4`
+- **Hypothesis**: The synchronous single-threaded `madvise(mmap_ptr, file_len, MADV_POPULATE_READ)` on 250 MB before query parsing took ~8.8 ms. Moving `madvise` to the 12 worker threads to populate their 20 MB chunks in parallel was hypothesized to cut startup latency by 7 ms.
+- **Implementation Changes**:
+  1. Removed synchronous `madvise` call before query parsing.
+  2. In Pass 1, each worker thread called `madvise(slice, MADV_POPULATE_READ)` on its chunk.
+  3. Removed `append_u32` to trim line count.
+- **Measurements (CPUs 0-7, 15 alternating pairs)**:
+  - Baseline Median: $T = 888.2$ ms, $M = 139.1$ MB, $S = 778$ lines (Board Est: 49.38 pts)
+  - Candidate Median: $T = 903.2$ ms, $M = 139.1$ MB, $S = 767$ lines (Board Est: 49.25 pts, $-0.13$ pts)
+  - Paired Median Improvement: **+0.38%**
+  - Candidate Win Rate: 8 / 15 pairs (53.3%)
+  - All Hashes Byte-Exact: PASS
+- **Root Cause Analysis**:
+  1. Multiple threads executing `MADV_POPULATE_READ` concurrently suffered from kernel page table lock contention (`mm->mmap_lock`), which degraded throughput compared to pre-faulting during the sequential phase while query files were being read.
+- **Verdict**: **REJECTED** (Formula score delta $-0.13$ pts $< +0.3$ gate; candidate reverted).
