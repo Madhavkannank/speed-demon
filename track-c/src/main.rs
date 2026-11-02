@@ -264,7 +264,7 @@ fn main() -> std::io::Result<()> {
         for (w, aggs_ref) in worker_aggs.iter_mut().enumerate() {
             let (start, end) = (bounds[w], bounds[w + 1]);
             thread::Builder::new()
-                .stack_size(262144)
+                .stack_size(131072)
                 .spawn_scoped(s, move || {
                     let reg_ptr = reg_usize as *const u8;
                     let raw_ptr = slice.as_ptr();
