@@ -56,7 +56,13 @@ impl FastTermTable {
     fn with_capacity(cap: usize) -> Self {
         assert!(cap.is_power_of_two());
         Self {
-            slots: vec![TableSlot { tag: u32::MAX, id: u32::MAX }; cap],
+            slots: vec![
+                TableSlot {
+                    tag: u32::MAX,
+                    id: u32::MAX
+                };
+                cap
+            ],
             mask: cap - 1,
             arena: Vec::with_capacity(1024 * 1024),
             entries: Vec::with_capacity(100000),
@@ -77,7 +83,10 @@ impl FastTermTable {
                 for &b in term {
                     self.arena.push(b | 0x20);
                 }
-                self.entries.push(TermEntry { offset, len: term.len() as u16 });
+                self.entries.push(TermEntry {
+                    offset,
+                    len: term.len() as u16,
+                });
                 unsafe {
                     *self.slots.get_unchecked_mut(idx) = TableSlot { tag, id };
                 }
@@ -366,7 +375,10 @@ fn main() -> std::io::Result<()> {
                         ops.push((op_code, tid));
                     }
                 }
-                parsed_queries.push(ParsedQuery::Bool { first_term: first_id, ops });
+                parsed_queries.push(ParsedQuery::Bool {
+                    first_term: first_id,
+                    ops,
+                });
             } else {
                 parsed_queries.push(ParsedQuery::Empty);
             }
@@ -421,12 +433,17 @@ fn main() -> std::io::Result<()> {
 
     // Build line_offsets table: 250,001 entries (starts of documents)
     // We can populate line_offsets efficiently during pass 1
-    let mut worker_counts: Vec<Vec<u32>> = (0..num_workers).map(|_| vec![0u32; vocab_size]).collect();
+    let mut worker_counts: Vec<Vec<u32>> =
+        (0..num_workers).map(|_| vec![0u32; vocab_size]).collect();
     let mut worker_doc_starts: Vec<Vec<u32>> = (0..num_workers).map(|_| Vec::new()).collect();
 
     // PASS 1: Count postings per (worker, term) and record doc start offsets
     thread::scope(|s| {
-        for (w, (counts_ref, doc_starts_ref)) in worker_counts.iter_mut().zip(worker_doc_starts.iter_mut()).enumerate() {
+        for (w, (counts_ref, doc_starts_ref)) in worker_counts
+            .iter_mut()
+            .zip(worker_doc_starts.iter_mut())
+            .enumerate()
+        {
             let (start, end) = (chunk_bounds[w], chunk_bounds[w + 1]);
             let slice = &mmap_slice[start..end];
             let table_ref = &table;
@@ -463,14 +480,15 @@ fn main() -> std::io::Result<()> {
                             let count = (p - start_t).min(32);
                             let mut h = 0x517cc1b727220a95u64;
                             for k in 0..count {
-                                h = (h.rotate_left(5)
-                                    ^ ((slice[start_t + k] | 0x20) as u64))
+                                h = (h.rotate_left(5) ^ ((slice[start_t + k] | 0x20) as u64))
                                     .wrapping_mul(0x9e3779b97f4a7c15);
                             }
                             let h32 = (h ^ (h >> 32)) as u32;
                             let bit = (h32 & 0xFFFF) as usize;
                             if ((bitset_ref[bit >> 6] >> (bit & 63)) & 1) != 0 {
-                                if let Some(id) = table_ref.lookup(&slice[start_t..start_t + count], h32) {
+                                if let Some(id) =
+                                    table_ref.lookup(&slice[start_t..start_t + count], h32)
+                                {
                                     let id_usize = id as usize;
                                     if last_seen[id_usize] != doc_id {
                                         last_seen[id_usize] = doc_id;
@@ -563,14 +581,15 @@ fn main() -> std::io::Result<()> {
                             let count = (p - start_t).min(32);
                             let mut h = 0x517cc1b727220a95u64;
                             for k in 0..count {
-                                h = (h.rotate_left(5)
-                                    ^ ((slice[start_t + k] | 0x20) as u64))
+                                h = (h.rotate_left(5) ^ ((slice[start_t + k] | 0x20) as u64))
                                     .wrapping_mul(0x9e3779b97f4a7c15);
                             }
                             let h32 = (h ^ (h >> 32)) as u32;
                             let bit = (h32 & 0xFFFF) as usize;
                             if ((bitset_ref[bit >> 6] >> (bit & 63)) & 1) != 0 {
-                                if let Some(id) = table_ref.lookup(&slice[start_t..start_t + count], h32) {
+                                if let Some(id) =
+                                    table_ref.lookup(&slice[start_t..start_t + count], h32)
+                                {
                                     let id_usize = id as usize;
                                     if last_seen[id_usize] != doc_id {
                                         last_seen[id_usize] = doc_id;
@@ -608,11 +627,8 @@ fn main() -> std::io::Result<()> {
     let (offsets_ref, postings_ref) = (&term_offsets, &all_postings);
 
     thread::scope(|s| {
-        let (queries_ref, mmap_ref, line_offsets_ref) = (
-            &parsed_queries,
-            &mmap_slice,
-            &line_offsets,
-        );
+        let (queries_ref, mmap_ref, line_offsets_ref) =
+            (&parsed_queries, &mmap_slice, &line_offsets);
         let get_postings = |tid: u32| -> &[u32] {
             let t = tid as usize;
             &postings_ref[offsets_ref[t]..offsets_ref[t + 1]]
@@ -705,7 +721,10 @@ fn main() -> std::io::Result<()> {
                                 let line_slice = &mmap_ref[f_offset..f_end];
                                 // Skip doc_id and tab
                                 let mut dp = 0;
-                                while dp < line_slice.len() && line_slice[dp] != b'\t' && line_slice[dp] != b'\n' {
+                                while dp < line_slice.len()
+                                    && line_slice[dp] != b'\t'
+                                    && line_slice[dp] != b'\n'
+                                {
                                     dp += 1;
                                 }
                                 if dp < line_slice.len() && line_slice[dp] == b'\t' {

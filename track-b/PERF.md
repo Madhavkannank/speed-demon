@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | E2+E3+E4: Flat open-addressing table, 64KB bitset prefilter, branchless token scan, and two-pass arena postings | RUN-ID: <fill> | 0.888 | 131.5 | +5.672 dpts |
 | 11 | E5: Zero-copy 0-op and 1-op BOOL evaluation directly from arena slices | RUN-ID: <fill> | 0.765 | 131.5 | +5.956 dpts |
 | 12 | B5: AVX2 start-bit scanning, SWAR hashing, and inlined 32-byte TableSlot vocabulary | local paired (15/15 wins) | 0.798 | 133.2 | +0.604 dpts |
+| 13 | B6: Single-pass AVX2 doc scan, on-the-fly phrase matching via 2-hash 256KB Bloom + 1M-bit pair filter, top-783 dense term bitsets, parallel prefix-sum posting merge | local verified (f86973... match) | 0.481 | 188.8 | 54.20 pts (Board est: 53.52) |
 
 ## Detailed Experiment Logs (Phase 1)
 
