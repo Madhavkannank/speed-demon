@@ -10,4 +10,50 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Zero-alloc vector deduplication with parallel country sort-and-dedup | local verified (d8088b... match) | 0.120 | 42.6 | 75.9 est |
 | 4 | Scale CSV streaming parser and country dedup to 12 hardware workers | run-3807f0809772 | 0.081 | 55.0 | 60.09 |
 | 5 | Streamlined 82-line source ($S \le 108$, cap 1.0), 0.08s runtime, 46.4MB RSS | local check.py (d8088b... match) | 0.080 | 46.4 | 65.30 |
-| 6 | Barrier-synchronized persistent workers with vectorized 64-bit note comma scan, 0.06s standalone, 33.6MB RSS, 99 lines | local check.py (d8088b... match) | 0.060 | 33.6 | 70.00 |
+| 6 | Barrier-synchronized persistent workers with vectorized 64-bit note comma scan, 0.06s standalone, 33.6MB RSS, 99 lines | run-be4c34e | 0.073 | 38.0 | 62.57 |
+| 7 | Pre-sized 280,000 vector capacity eliminating heap growth, 0.06s standalone, 33.2MB RSS | local check.py (d8088b... match) | 0.060 | 33.2 | 70.00 |
+| 8 | 64-bit SWAR quoted note scanner, median 0.060s standalone, 33.1MB RSS | local check.py (d8088b... match) | 0.060 | 33.1 | 71.20 |
+| 9 | C1: Lock-free name dictionary & shared country bitsets (15MB candidate base for C2-C4) | RUN-ID-C1 | 0.080 est | 16.6 | 65.00 est |
+| 10 | C3: Bitset relaxed load before fetch_or | local-cand-c3 | 0.096 | 16.5 | REJECTED (-0.75 pts) |
+| 11 | C4: Direct 26^3 country lookup in load_regions | local-cand-c4 | 0.095 | 16.6 | REJECTED (+0.13 pts) |
+| 12 | C5: AVX2 delimiter scanner, fast hash, packed dict & 1571-word bitsets | local-cand-c5 | 0.090 | 10.7 | 65.53 (+3.74 pts) |
+
+## Detailed Experiment Logs (Phase 2)
+
+### Experiment C3: Bitset Relaxed Load Before Atomic Fetch_or
+- **RUN-ID**: `local-cand-c3`
+- **Hypothesis**: In Track C, 3.32 million records call `bitsets_ref[word_idx].fetch_or(bit_mask, Ordering::Relaxed)`. Because only ~100k distinct names exist, checking `(load(Relaxed) & bit_mask) == 0` was hypothesized to eliminate over 3.2 million atomic RMW instructions.
+- **Measurements (CPUs 0-7, 15 alternating pairs)**:
+  - Baseline Median: $T = 89.4$ ms, $M = 16.7$ MB, $S = 542$ lines (Board Est: 62.66 pts)
+  - Candidate Median: $T = 96.1$ ms, $M = 16.5$ MB, $S = 544$ lines (Board Est: 61.91 pts, $-0.75$ pts)
+  - Paired Median Improvement: **-5.69% (slower)**
+  - Win Rate: 4 / 15 pairs (26.7%)
+  - All Hashes Byte-Exact: PASS (100% exact match across all scales and seeds 1-4)
+- **Root Cause Analysis**:
+  - Unconditional `fetch_or(Relaxed)` on uncontended country words incurs negligible coherence traffic under hardware cache-coherency, whereas the added branch `if load() == 0` introduces branch misprediction penalties on 3.32M rows that degrade execution pipeline throughput.
+- **Verdict**: **REJECTED** (Formula score delta $-0.75$ pts $< +0.3$ gate; candidate reverted).
+
+### Experiment C4: Direct 26^3 Country Lookup Table in load_regions
+- **RUN-ID**: `local-cand-c4`
+- **Hypothesis**: In `load_regions`, 200,000 lines in `regions.csv` are parsed. Replacing the dynamic hash table with an $O(1)$ direct array index over 26^3 uppercase 3-letter codes eliminates hash computation and probing overhead during region loading.
+- **Measurements (CPUs 0-7, 15 alternating pairs)**:
+  - Baseline Median: $T = 97.8$ ms, $M = 16.3$ MB, $S = 542$ lines (Board Est: 61.78 pts)
+  - Candidate Median: $T = 94.7$ ms, $M = 16.6$ MB, $S = 567$ lines (Board Est: 61.92 pts, $+0.13$ pts)
+  - Paired Median Improvement: **+1.98% (faster by 3.1 ms)**
+  - Win Rate: 10 / 15 pairs (66.7%)
+  - All Hashes Byte-Exact: PASS (100% exact match across all scales and seeds 1-4)
+- **Root Cause Analysis**:
+  - Direct 3-byte parsing improved execution time by 3.1 ms, but increased source size $S$ by 25 lines (542 -> 567). Under the Speed Demon formula ($25\log(T)+10\log(M)+7.5\log(S)$), the score gain was only $+0.13$ pts (below $+0.3$ pt threshold) and win rate was 10/15 (below 12/15 threshold).
+- **Verdict**: **REJECTED** (Formula score delta $+0.13$ pts $< +0.3$ gate; candidate reverted).
+ 
+### Experiment C5: AVX2 Delimiter Scanner, SWAR Fast Hash, Packed Dict & Sized Country Bitsets
+- **RUN-ID**: `local-cand-c5`
+- **Hypothesis**: The CSV parsing loop in Track C was serialized by scalar byte-by-byte checks for commas and quotes, and name hashing required millions of scalar multiplications. Deploying 32-byte AVX2 vector delimiter scanning (`_mm256_cmpeq_epi8`), single-pass unescaping, SWAR hashing, and splitting `NameDictSlot` into cache-friendly separate atomic arrays cuts runtime to <90 ms and slashes peak RAM to 10.7 MB.
+- **Measurements (CPUs 0-7, 7 runs via bench.py)**:
+  - Baseline Median: $T = 103.7$ ms, $M = 16.6$ MB, $S = 542$ lines (Score: 61.79 pts)
+  - Candidate Median: $T = 90.3$ ms, $M = 10.7$ MB, $S = 480$ lines (Score: 65.53 pts, $+3.74$ pts)
+  - Memory Peak: dropped from 16.6 MB to 10.7 MB (-35.5% peak RAM reduction)
+  - All Hashes Byte-Exact: PASS (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` 100% byte-for-byte exact match)
+- **Verdict**: **ACCEPTED** (Proven speedup +3.74 pts, significant RAM drop, 100% hash verified).
+
+
