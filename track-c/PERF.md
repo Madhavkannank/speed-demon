@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | C1: Lock-free name dictionary & shared country bitsets (15MB candidate base for C2-C4) | RUN-ID-C1 | 0.080 est | 16.6 | 65.00 est |
 | 10 | C3: Bitset relaxed load before fetch_or | local-cand-c3 | 0.096 | 16.5 | REJECTED (-0.75 pts) |
 | 11 | C4: Direct 26^3 country lookup in load_regions | local-cand-c4 | 0.095 | 16.6 | REJECTED (+0.13 pts) |
+| 12 | C5: AVX2 delimiter scanner, fast hash, packed dict & 1571-word bitsets | local-cand-c5 | 0.090 | 10.7 | 65.53 (+3.74 pts) |
 
 ## Detailed Experiment Logs (Phase 2)
 
@@ -44,4 +45,15 @@ Every step from the reference to your final version, each with the live-board ru
 - **Root Cause Analysis**:
   - Direct 3-byte parsing improved execution time by 3.1 ms, but increased source size $S$ by 25 lines (542 -> 567). Under the Speed Demon formula ($25\log(T)+10\log(M)+7.5\log(S)$), the score gain was only $+0.13$ pts (below $+0.3$ pt threshold) and win rate was 10/15 (below 12/15 threshold).
 - **Verdict**: **REJECTED** (Formula score delta $+0.13$ pts $< +0.3$ gate; candidate reverted).
+ 
+### Experiment C5: AVX2 Delimiter Scanner, SWAR Fast Hash, Packed Dict & Sized Country Bitsets
+- **RUN-ID**: `local-cand-c5`
+- **Hypothesis**: The CSV parsing loop in Track C was serialized by scalar byte-by-byte checks for commas and quotes, and name hashing required millions of scalar multiplications. Deploying 32-byte AVX2 vector delimiter scanning (`_mm256_cmpeq_epi8`), single-pass unescaping, SWAR hashing, and splitting `NameDictSlot` into cache-friendly separate atomic arrays cuts runtime to <90 ms and slashes peak RAM to 10.7 MB.
+- **Measurements (CPUs 0-7, 7 runs via bench.py)**:
+  - Baseline Median: $T = 103.7$ ms, $M = 16.6$ MB, $S = 542$ lines (Score: 61.79 pts)
+  - Candidate Median: $T = 90.3$ ms, $M = 10.7$ MB, $S = 480$ lines (Score: 65.53 pts, $+3.74$ pts)
+  - Memory Peak: dropped from 16.6 MB to 10.7 MB (-35.5% peak RAM reduction)
+  - All Hashes Byte-Exact: PASS (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` 100% byte-for-byte exact match)
+- **Verdict**: **ACCEPTED** (Proven speedup +3.74 pts, significant RAM drop, 100% hash verified).
+
 

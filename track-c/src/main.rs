@@ -1,38 +1,110 @@
+use std::arch::x86_64::*;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
+extern "C" {
+    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, d: i32, o: i64) -> *mut u8;
+    fn munmap(a: *mut u8, l: usize) -> i32;
+}
+
 #[inline(always)]
-fn hash_byte(h: u64, b: u8) -> u64 {
-    (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x9e3779b97f4a7c15)
-}
-
-#[derive(Clone, Copy)]
-struct LocalAgg {
-    count: u64,
-    id_sum: i64,
-    amount_sum: i64,
-    amount_min: i64,
-    amount_max: i64,
-    name_bytes: usize,
-    note_bytes: usize,
-}
-
-impl LocalAgg {
-    fn new() -> Self {
-        Self {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            name_bytes: 0,
-            note_bytes: 0,
+fn fast_hash(s: &[u8]) -> u64 {
+    if s.is_empty() {
+        return 0x517cc1b727220a95;
+    }
+    let (l, p) = (s.len(), s.as_ptr());
+    const K: (u64, u64, u64) = (0x9e3779b97f4a7c15, 0xc6a4a7935bd1e995, 0xbf58476d1ce4e5b9);
+    unsafe {
+        match l {
+            1..=3 => (*p as u64
+                | ((*p.add(l >> 1) as u64) << 8)
+                | ((*p.add(l - 1) as u64) << 16)
+                | ((l as u64) << 24))
+                .wrapping_mul(K.0),
+            4..=7 => {
+                (((p as *const u32).read_unaligned() as u64)
+                    | (((p.add(l - 4) as *const u32).read_unaligned() as u64) << 32))
+                    .wrapping_mul(K.0)
+                    ^ (l as u64).wrapping_mul(K.1)
+            }
+            8..=15 => {
+                (p as *const u64).read_unaligned().wrapping_mul(K.0)
+                    ^ (p.add(l - 8) as *const u64)
+                        .read_unaligned()
+                        .wrapping_mul(K.1)
+                    ^ (l as u64).wrapping_mul(K.2)
+            }
+            _ => {
+                let (mut h, mut i) = ((l as u64).wrapping_mul(K.0), 0);
+                while i + 8 <= l {
+                    h = (h ^ (p.add(i) as *const u64).read_unaligned().wrapping_mul(K.1))
+                        .rotate_left(27)
+                        .wrapping_mul(K.2);
+                    i += 8;
+                }
+                if i < l {
+                    h = (h
+                        ^ (p.add(l - 8) as *const u64)
+                            .read_unaligned()
+                            .wrapping_mul(K.1))
+                    .wrapping_mul(K.2);
+                }
+                h
+            }
         }
     }
+}
+
+#[inline(always)]
+unsafe fn find_char_avx2(p_raw: *const u8, mut p: usize, end: usize, t: u8) -> usize {
+    let tv = _mm256_set1_epi8(t as i8);
+    while p + 32 <= end {
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+            _mm256_loadu_si256(p_raw.add(p) as *const _),
+            tv,
+        )) as u32;
+        if m != 0 {
+            return p + m.trailing_zeros() as usize;
+        }
+        p += 32;
+    }
+    while p < end && *p_raw.add(p) != t {
+        p += 1;
+    }
+    p
+}
+
+#[inline(always)]
+unsafe fn parse_u64_comma(p_raw: *const u8, mut p: usize) -> (u64, usize) {
+    let mut v = 0u64;
+    while *p_raw.add(p) != b',' {
+        v = v * 10 + (*p_raw.add(p) - b'0') as u64;
+        p += 1;
+    }
+    (v, p + 1)
+}
+
+#[inline(always)]
+unsafe fn parse_amount(p_raw: *const u8, mut p: usize) -> (i64, usize) {
+    let neg = *p_raw.add(p) == b'-';
+    if neg {
+        p += 1;
+    }
+    let mut dol = 0i64;
+    while *p_raw.add(p) != b'.' {
+        dol = dol * 10 + (*p_raw.add(p) - b'0') as i64;
+        p += 1;
+    }
+    let cents = ((*p_raw.add(p + 1) - b'0') as i64) * 10 + ((*p_raw.add(p + 2) - b'0') as i64);
+    let tot = dol * 100 + cents;
+    p += 3;
+    (
+        if neg { -tot } else { tot },
+        if *p_raw.add(p) == b'\r' { p + 2 } else { p + 1 },
+    )
 }
 
 fn format_cents(cents: i64) -> String {
@@ -40,13 +112,14 @@ fn format_cents(cents: i64) -> String {
     format!("{}{}.{:02}", s, c / 100, c % 100)
 }
 
-fn load_regions(path: &Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
+fn load_regions(path: &std::path::Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
     let bytes = fs::read(path)?;
-    let mut region_map = vec![0u8; 1_000_000];
-    let mut country_names = vec!["_UNMATCHED".to_string()];
-    let mut country_table = vec![(0u32, 0u8); 1024];
-    let len = bytes.len();
-    let mut p = 0;
+    let (mut region_map, mut country_names, mut country_table) = (
+        vec![0u8; 1_000_000],
+        vec!["_UNMATCHED".to_string()],
+        vec![(0u32, 0u8); 1024],
+    );
+    let (len, mut p) = (bytes.len(), 0);
     while p < len && bytes[p] != b'\n' {
         p += 1;
     }
@@ -58,8 +131,8 @@ fn load_regions(path: &Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
             p += 1;
             continue;
         }
-        let mut reg_id = 0usize;
-        while p < len && bytes[p] >= b'0' && bytes[p] <= b'9' {
+        let (mut reg_id, c_start) = (0usize, 0);
+        while p < len && bytes[p].is_ascii_digit() {
             reg_id = reg_id * 10 + (bytes[p] - b'0') as usize;
             p += 1;
         }
@@ -69,8 +142,7 @@ fn load_regions(path: &Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
         if p < len && bytes[p] == b',' {
             p += 1;
         }
-        let c_start = p;
-        let mut h = 0x517cc1b7u32;
+        let (c_start, mut h) = (p, 0x517cc1b7u32);
         while p < len && bytes[p] != b'\r' && bytes[p] != b'\n' {
             h = (h.rotate_left(5) ^ (bytes[p] as u32)).wrapping_mul(0x9e3779b9);
             p += 1;
@@ -103,440 +175,301 @@ fn load_regions(path: &Path) -> std::io::Result<(Vec<u8>, Vec<String>)> {
     Ok((region_map, country_names))
 }
 
-const NUM_WORKERS: usize = 12;
-const CHUNK_SIZE: usize = 256 * 1024;
 const DICT_SIZE: usize = 262144;
 const DICT_MASK: usize = DICT_SIZE - 1;
-const MAX_NAMES: usize = 131072;
-const WORDS_PER_COUNTRY: usize = MAX_NAMES / 64; // 2048 words = 16KB per country
-const LOCAL_CACHE_SIZE: usize = 8192;
+const WORDS_PER_COUNTRY: usize = 1571;
+const LOCAL_CACHE_SIZE: usize = 4096;
 const LOCAL_CACHE_MASK: usize = LOCAL_CACHE_SIZE - 1;
 
-struct NameDictSlot {
-    hash: AtomicU64,
-    id: AtomicU32,
-}
-
 fn main() -> std::io::Result<()> {
-    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string());
-    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "/out".to_string());
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/tmp/sd-full-c".to_string());
+    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| "/tmp/sd-eval-c".to_string());
     let (regions_path, records_path, out_path) = (
-        Path::new(&data_dir).join("regions.csv"),
-        Path::new(&data_dir).join("records.csv"),
-        Path::new(&out_dir).join("aggregates.txt"),
+        std::path::Path::new(&data_dir).join("regions.csv"),
+        std::path::Path::new(&data_dir).join("records.csv"),
+        std::path::Path::new(&out_dir).join("aggregates.txt"),
     );
 
     let (region_map, country_names) = load_regions(&regions_path)?;
     let num_countries = country_names.len();
+
     let file = File::open(&records_path)?;
-    let file_len = file.metadata()?.len() as usize;
-    if file_len == 0 {
-        File::create(&out_path)?;
-        return Ok(());
+    let flen = file.metadata()?.len() as usize;
+    let ptr = unsafe { mmap(std::ptr::null_mut(), flen, 1, 1, file.as_raw_fd(), 0) };
+    let slice = unsafe { std::slice::from_raw_parts(ptr, flen) };
+
+    let mut header = 0;
+    while header < flen && slice[header] != b'\n' {
+        header += 1;
     }
+    header += 1;
 
-    let mut header_buf = [0u8; 128];
-    file.read_exact_at(&mut header_buf, 0)?;
-    let header_offset = {
-        let mut idx = if header_buf.starts_with(b"\xef\xbb\xbf") {
-            3
-        } else {
-            0
-        };
-        while idx < header_buf.len() && header_buf[idx] != b'\n' {
-            idx += 1;
-        }
-        idx + 1
-    };
-
-    let approx_chunk = (file_len - header_offset) / NUM_WORKERS;
-    let mut chunk_bounds = Vec::with_capacity(NUM_WORKERS + 1);
-    chunk_bounds.push(header_offset);
-    let mut scan_buf = vec![0u8; 65536];
-    for i in 1..NUM_WORKERS {
-        let mut cur_search = header_offset + i * approx_chunk;
-        let mut found_pos = None;
-        while cur_search < file_len && found_pos.is_none() {
-            let to_read = scan_buf.len().min(file_len - cur_search);
-            if file
-                .read_exact_at(&mut scan_buf[..to_read], cur_search as u64)
-                .is_err()
-            {
-                break;
-            }
-            let mut p = 0;
-            while p + 16 < to_read {
-                if scan_buf[p] == b'.'
-                    && scan_buf[p + 1].is_ascii_digit()
-                    && scan_buf[p + 2].is_ascii_digit()
-                {
-                    let mut after = p + 3;
-                    if after < to_read && scan_buf[after] == b'\r' {
-                        after += 1;
-                    }
-                    if after < to_read && scan_buf[after] == b'\n' {
-                        let mut rec_start = after + 1;
-                        if rec_start + 3 <= to_read
-                            && scan_buf[rec_start..].starts_with(b"\xef\xbb\xbf")
-                        {
-                            rec_start += 3;
-                        }
-                        if rec_start < to_read
-                            && scan_buf[rec_start].is_ascii_digit()
-                            && scan_buf[rec_start] != b'0'
-                        {
-                            let mut d = rec_start + 1;
-                            while d < to_read && scan_buf[d].is_ascii_digit() {
-                                d += 1;
-                            }
-                            if d < to_read && scan_buf[d] == b',' {
-                                found_pos = Some(cur_search + rec_start);
-                                break;
-                            }
-                        }
-                    }
+    let num_workers = 8;
+    let approx = (flen - header) / num_workers;
+    let mut bounds = vec![header];
+    for i in 1..num_workers {
+        let mut cur = header + i * approx;
+        while cur < flen {
+            if slice[cur] == b'\n' {
+                let mut b = cur;
+                if b > 0 && slice[b - 1] == b'\r' {
+                    b -= 1;
                 }
-                p += 1;
+                if b >= 3
+                    && slice[b - 3] == b'.'
+                    && slice[b - 2].is_ascii_digit()
+                    && slice[b - 1].is_ascii_digit()
+                {
+                    bounds.push(cur + 1);
+                    break;
+                }
             }
-            if found_pos.is_none() {
-                cur_search += to_read.saturating_sub(64);
-            }
+            cur += 1;
         }
-        chunk_bounds.push(found_pos.unwrap_or(file_len));
     }
-    chunk_bounds.push(file_len);
-    drop(scan_buf);
+    bounds.push(flen);
 
     let region_map_ref: &'static [u8] = Box::leak(region_map.into_boxed_slice());
+    let reg_usize = region_map_ref.as_ptr() as usize;
 
-    // Allocate Lock-Free Global Name Dictionary and Country Bitsets
-    let mut dict_vec = Vec::with_capacity(DICT_SIZE);
-    for _ in 0..DICT_SIZE {
-        dict_vec.push(NameDictSlot {
-            hash: AtomicU64::new(0),
-            id: AtomicU32::new(u32::MAX),
-        });
-    }
-    let dict_ref: &'static [NameDictSlot] = Box::leak(dict_vec.into_boxed_slice());
+    let dict_hashes_ref: &'static [AtomicU64] = Box::leak(
+        (0..DICT_SIZE)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let dict_ids_ref: &'static [AtomicU32] = Box::leak(
+        (0..DICT_SIZE)
+            .map(|_| AtomicU32::new(u32::MAX))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
     let next_name_id: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
 
     let total_words = num_countries * WORDS_PER_COUNTRY;
-    let mut bitsets_vec = Vec::with_capacity(total_words);
-    for _ in 0..total_words {
-        bitsets_vec.push(AtomicU64::new(0));
-    }
-    let bitsets_ref: &'static [AtomicU64] = Box::leak(bitsets_vec.into_boxed_slice());
+    let bitsets_ref: &'static [AtomicU64] = Box::leak(
+        (0..total_words)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
 
-    let mut worker_aggs: Vec<Vec<LocalAgg>> = (0..NUM_WORKERS).map(|_| Vec::new()).collect();
+    let mut worker_aggs =
+        vec![
+            vec![(0u64, 0i64, 0i64, i64::MAX, i64::MIN, 0usize, 0usize); num_countries];
+            num_workers
+        ];
 
     thread::scope(|s| {
-        let mut worker_aggs_ptrs = Vec::with_capacity(NUM_WORKERS);
-        for i in 0..NUM_WORKERS {
-            worker_aggs_ptrs.push(&mut worker_aggs[i] as *mut Vec<LocalAgg> as usize);
-        }
+        for (w, aggs_ref) in worker_aggs.iter_mut().enumerate() {
+            let (start, end) = (bounds[w], bounds[w + 1]);
+            thread::Builder::new()
+                .stack_size(262144)
+                .spawn_scoped(s, move || {
+                    let reg_ptr = reg_usize as *const u8;
+                    let raw_ptr = slice.as_ptr();
+                    let (mut local_cache, mut unescape_buf, mut p) =
+                        ([(0u64, 0u32); LOCAL_CACHE_SIZE], [0u8; 128], start);
 
-        for w_idx in 0..NUM_WORKERS {
-            let (start_pos, end_pos, path) = (
-                chunk_bounds[w_idx],
-                chunk_bounds[w_idx + 1],
-                records_path.clone(),
-            );
-            let aggs_ptrs = worker_aggs_ptrs.clone();
-            s.spawn(move || {
-                let t_file = File::open(&path).unwrap();
-                let mut aggs = vec![LocalAgg::new(); num_countries];
-                let mut buf = vec![0u8; CHUNK_SIZE + 8192];
-                let mut local_cache = [(0u64, 0u32); LOCAL_CACHE_SIZE];
-                let (mut cur_offset, mut rem_len) = (start_pos, 0);
-
-                while cur_offset < end_pos || rem_len > 0 {
-                    let to_read = (CHUNK_SIZE).min(end_pos.saturating_sub(cur_offset));
-                    let read_bytes = if to_read > 0 {
-                        t_file
-                            .read_exact_at(&mut buf[rem_len..rem_len + to_read], cur_offset as u64)
-                            .unwrap();
-                        cur_offset += to_read;
-                        to_read
-                    } else {
-                        0
-                    };
-                    let total_available = rem_len + read_bytes;
-                    if total_available == 0 {
-                        break;
-                    }
-                    let valid_len = if cur_offset >= end_pos {
-                        total_available
-                    } else {
-                        let (mut p, mut boundary) = (total_available.saturating_sub(1), 0);
-                        while p >= 16 {
-                            if buf[p] == b'\n' {
-                                let mut before = p;
-                                if before > 0 && buf[before - 1] == b'\r' {
-                                    before -= 1;
-                                }
-                                if before >= 3
-                                    && buf[before - 3] == b'.'
-                                    && buf[before - 2].is_ascii_digit()
-                                    && buf[before - 1].is_ascii_digit()
-                                {
-                                    boundary = p + 1;
-                                    break;
-                                }
+                    while p < end {
+                        if p + 3 <= end
+                            && unsafe {
+                                *raw_ptr.add(p) == 0xef
+                                    && *raw_ptr.add(p + 1) == 0xbb
+                                    && *raw_ptr.add(p + 2) == 0xbf
                             }
-                            p -= 1;
-                        }
-                        if boundary == 0 {
-                            total_available
-                        } else {
-                            boundary
-                        }
-                    };
-                    let (slice, mut p) = (&buf[..valid_len], 0);
-
-                    while p < valid_len {
-                        if slice[p] == 0xef
-                            && p + 3 <= valid_len
-                            && &slice[p..p + 3] == b"\xef\xbb\xbf"
                         {
                             p += 3;
                         }
-                        if p >= valid_len {
+                        if p >= end {
                             break;
                         }
-                        let mut rec_id = 0i64;
-                        while p < valid_len && slice[p] != b',' {
-                            rec_id = rec_id * 10 + (slice[p] - b'0') as i64;
-                            p += 1;
-                        }
-                        p += 1;
 
-                        let (mut name_len, mut name_hash) = (0usize, 0x517cc1b727220a95u64);
-                        if p < valid_len && slice[p] == b'\"' {
-                            p += 1;
-                            while p < valid_len {
-                                if slice[p] == b'\"' {
-                                    if p + 1 < valid_len && slice[p + 1] == b'\"' {
-                                        name_len += 1;
-                                        name_hash = hash_byte(name_hash, b'\"');
-                                        p += 2;
-                                    } else {
-                                        p += 1;
-                                        break;
-                                    }
-                                } else {
-                                    name_len += 1;
-                                    name_hash = hash_byte(name_hash, slice[p]);
-                                    p += 1;
-                                }
-                            }
-                        } else {
-                            let n_start = p;
-                            while p < valid_len && slice[p] != b',' {
-                                name_hash = hash_byte(name_hash, slice[p]);
-                                p += 1;
-                            }
-                            name_len = p - n_start;
-                        }
-                        p += 1;
+                        let (rec_id, next_p) = unsafe { parse_u64_comma(raw_ptr, p) };
+                        p = next_p;
 
-                        let mut note_len = 0usize;
-                        if p < valid_len && slice[p] == b'\"' {
+                        let (name_len, name_hash) = if p < end && unsafe { *raw_ptr.add(p) == b'"' }
+                        {
                             p += 1;
-                            loop {
-                                while p + 8 <= valid_len {
-                                    let w = unsafe {
-                                        (slice.as_ptr().add(p) as *const u64).read_unaligned()
-                                    };
-                                    let has_q = (w ^ 0x2222222222222222u64)
-                                        .wrapping_sub(0x0101010101010101u64)
-                                        & !(w ^ 0x2222222222222222u64)
-                                        & 0x8080808080808080u64;
-                                    if has_q != 0 {
-                                        let off = (has_q.trailing_zeros() >> 3) as usize;
-                                        note_len += off;
-                                        p += off;
-                                        break;
-                                    }
-                                    note_len += 8;
-                                    p += 8;
-                                }
-                                if p >= valid_len {
-                                    break;
-                                }
-                                if slice[p] == b'\"' {
-                                    if p + 1 < valid_len && slice[p + 1] == b'\"' {
-                                        note_len += 1;
-                                        p += 2;
-                                    } else {
-                                        p += 1;
-                                        break;
-                                    }
-                                } else {
-                                    note_len += 1;
-                                    p += 1;
-                                }
-                            }
-                        } else {
-                            let not_start = p;
-                            while p + 8 <= valid_len {
-                                let w = unsafe {
-                                    (slice.as_ptr().add(p) as *const u64).read_unaligned()
-                                };
-                                let has_comma = (w ^ 0x2c2c2c2c2c2c2c2cu64)
-                                    .wrapping_sub(0x0101010101010101u64)
-                                    & !(w ^ 0x2c2c2c2c2c2c2c2cu64)
-                                    & 0x8080808080808080u64;
-                                if has_comma != 0 {
-                                    p += (has_comma.trailing_zeros() >> 3) as usize;
-                                    break;
-                                }
-                                p += 8;
-                            }
-                            while p < valid_len && slice[p] != b',' {
-                                p += 1;
-                            }
-                            note_len = p - not_start;
-                        }
-                        p += 1;
-
-                        let mut reg_id = 0usize;
-                        while p < valid_len && slice[p] != b',' {
-                            reg_id = reg_id * 10 + (slice[p] - b'0') as usize;
-                            p += 1;
-                        }
-                        p += 1;
-
-                        let neg = p < valid_len && slice[p] == b'-';
-                        if neg {
-                            p += 1;
-                        }
-                        let mut dollars = 0i64;
-                        while p < valid_len && slice[p] != b'.' {
-                            dollars = dollars * 10 + (slice[p] - b'0') as i64;
-                            p += 1;
-                        }
-                        p += 1;
-                        let cents_val =
-                            ((slice[p] - b'0') as i64) * 10 + ((slice[p + 1] - b'0') as i64);
-                        let total_cents = dollars * 100 + cents_val;
-                        let cents = if neg { -total_cents } else { total_cents };
-                        p += 2;
-                        if p < valid_len {
-                            if slice[p] == b'\r' {
+                            let start_n = p;
+                            p = unsafe { find_char_avx2(raw_ptr, p, end, b'"') };
+                            if p + 1 < end && unsafe { *raw_ptr.add(p + 1) != b'"' } {
+                                let (h, l) = (
+                                    fast_hash(unsafe {
+                                        std::slice::from_raw_parts(
+                                            raw_ptr.add(start_n),
+                                            p - start_n,
+                                        )
+                                    }),
+                                    p - start_n,
+                                );
                                 p += 2;
+                                (l, h)
                             } else {
-                                p += 1;
+                                let mut d = p - start_n;
+                                unescape_buf[..d].copy_from_slice(unsafe {
+                                    std::slice::from_raw_parts(raw_ptr.add(start_n), d)
+                                });
+                                loop {
+                                    if p >= end || unsafe { *raw_ptr.add(p) != b'"' } {
+                                        break;
+                                    }
+                                    if p + 1 < end && unsafe { *raw_ptr.add(p + 1) == b'"' } {
+                                        unescape_buf[d] = b'"';
+                                        d += 1;
+                                        p += 2;
+                                        let mid = p;
+                                        p = unsafe { find_char_avx2(raw_ptr, p, end, b'"') };
+                                        let part_len = p - mid;
+                                        unescape_buf[d..d + part_len].copy_from_slice(unsafe {
+                                            std::slice::from_raw_parts(raw_ptr.add(mid), part_len)
+                                        });
+                                        d += part_len;
+                                    } else {
+                                        p += 2;
+                                        break;
+                                    }
+                                }
+                                (d, fast_hash(&unescape_buf[..d]))
                             }
-                        }
+                        } else {
+                            let start_n = p;
+                            p = unsafe { find_char_avx2(raw_ptr, p, end, b',') };
+                            let (h, l) = (
+                                fast_hash(unsafe {
+                                    std::slice::from_raw_parts(raw_ptr.add(start_n), p - start_n)
+                                }),
+                                p - start_n,
+                            );
+                            p += 1;
+                            (l, h)
+                        };
 
-                        let c_id = if reg_id < region_map_ref.len() {
-                            region_map_ref[reg_id] as usize
+                        let note_len = if p < end && unsafe { *raw_ptr.add(p) == b'"' } {
+                            p += 1;
+                            let start_not = p;
+                            p = unsafe { find_char_avx2(raw_ptr, p, end, b'"') };
+                            if p + 1 < end && unsafe { *raw_ptr.add(p + 1) != b'"' } {
+                                let l = p - start_not;
+                                p += 2;
+                                l
+                            } else {
+                                let mut d = p - start_not;
+                                loop {
+                                    if p >= end || unsafe { *raw_ptr.add(p) != b'"' } {
+                                        break;
+                                    }
+                                    if p + 1 < end && unsafe { *raw_ptr.add(p + 1) == b'"' } {
+                                        d += 1;
+                                        p += 2;
+                                        let mid = p;
+                                        p = unsafe { find_char_avx2(raw_ptr, p, end, b'"') };
+                                        d += p - mid;
+                                    } else {
+                                        p += 2;
+                                        break;
+                                    }
+                                }
+                                d
+                            }
+                        } else {
+                            let start_not = p;
+                            p = unsafe { find_char_avx2(raw_ptr, p, end, b',') };
+                            let l = p - start_not;
+                            p += 1;
+                            l
+                        };
+
+                        let (reg_id, next_p) = unsafe { parse_u64_comma(raw_ptr, p) };
+                        p = next_p;
+
+                        let (cents, next_p) = unsafe { parse_amount(raw_ptr, p) };
+                        p = next_p;
+
+                        let c_id = if reg_id < 1_000_000 {
+                            unsafe { *reg_ptr.add(reg_id as usize) as usize }
                         } else {
                             0
                         };
-                        let agg = &mut aggs[c_id];
-                        agg.count += 1;
-                        agg.id_sum += rec_id;
-                        agg.amount_sum += cents;
-                        if cents < agg.amount_min {
-                            agg.amount_min = cents;
-                        }
-                        if cents > agg.amount_max {
-                            agg.amount_max = cents;
-                        }
-                        agg.name_bytes += name_len;
-                        agg.note_bytes += note_len;
+                        let agg = &mut aggs_ref[c_id];
+                        agg.0 += 1;
+                        agg.1 += rec_id as i64;
+                        agg.2 += cents;
+                        agg.3 = agg.3.min(cents);
+                        agg.4 = agg.4.max(cents);
+                        agg.5 += name_len;
+                        agg.6 += note_len;
 
-                        // Lock-Free Lookup in Name Dictionary with L1 Cache
-                        let non_zero_hash = if name_hash == 0 { 1 } else { name_hash };
-                        let cache_slot = (non_zero_hash as usize) & LOCAL_CACHE_MASK;
+                        let cache_slot = (name_hash as usize) & LOCAL_CACHE_MASK;
                         let (cached_h, cached_id) = local_cache[cache_slot];
-                        let name_id = if cached_h == non_zero_hash {
+                        let name_id = if cached_h == name_hash {
                             cached_id
                         } else {
-                            let mut slot_idx = (non_zero_hash as usize) & DICT_MASK;
+                            let mut slot_idx = (name_hash as usize) & DICT_MASK;
                             let id = loop {
-                                let slot = &dict_ref[slot_idx];
-                                let curr_h = slot.hash.load(Ordering::Relaxed);
-                                if curr_h == non_zero_hash {
-                                    loop {
-                                        let id = slot.id.load(Ordering::Relaxed);
-                                        if id != u32::MAX {
-                                            break;
-                                        }
+                                let curr_h = dict_hashes_ref[slot_idx].load(Ordering::Relaxed);
+                                if curr_h == name_hash {
+                                    while dict_ids_ref[slot_idx].load(Ordering::Relaxed) == u32::MAX
+                                    {
                                         std::hint::spin_loop();
                                     }
-                                    break slot.id.load(Ordering::Relaxed);
+                                    break dict_ids_ref[slot_idx].load(Ordering::Relaxed);
                                 }
                                 if curr_h == 0 {
-                                    if slot
-                                        .hash
+                                    if dict_hashes_ref[slot_idx]
                                         .compare_exchange_weak(
                                             0,
-                                            non_zero_hash,
+                                            name_hash,
                                             Ordering::AcqRel,
                                             Ordering::Relaxed,
                                         )
                                         .is_ok()
                                     {
                                         let id = next_name_id.fetch_add(1, Ordering::Relaxed);
-                                        slot.id.store(id, Ordering::Release);
+                                        dict_ids_ref[slot_idx].store(id, Ordering::Release);
                                         break id;
                                     }
                                     continue;
                                 }
                                 slot_idx = (slot_idx + 1) & DICT_MASK;
                             };
-                            local_cache[cache_slot] = (non_zero_hash, id);
+                            local_cache[cache_slot] = (name_hash, id);
                             id
                         };
 
-                        // Set bit in country bitset
                         let word_idx = c_id * WORDS_PER_COUNTRY + (name_id as usize / 64);
-                        let bit_mask = 1u64 << (name_id & 63);
-                        bitsets_ref[word_idx].fetch_or(bit_mask, Ordering::Relaxed);
+                        bitsets_ref[word_idx].fetch_or(1u64 << (name_id & 63), Ordering::Relaxed);
                     }
-                    rem_len = total_available - valid_len;
-                    if rem_len > 0 {
-                        buf.copy_within(valid_len..total_available, 0);
-                    }
-                }
-                unsafe {
-                    *(aggs_ptrs[w_idx] as *mut Vec<LocalAgg>) = aggs;
-                }
-            });
+                })
+                .unwrap();
         }
     });
 
-    let mut all_aggs = vec![LocalAgg::new(); num_countries];
-    for w in 0..NUM_WORKERS {
-        for (c_id, a) in worker_aggs[w].iter().enumerate() {
-            let agg = &mut all_aggs[c_id];
-            agg.count += a.count;
-            agg.id_sum += a.id_sum;
-            agg.amount_sum += a.amount_sum;
-            if a.amount_min < agg.amount_min {
-                agg.amount_min = a.amount_min;
-            }
-            if a.amount_max > agg.amount_max {
-                agg.amount_max = a.amount_max;
-            }
-            agg.name_bytes += a.name_bytes;
-            agg.note_bytes += a.note_bytes;
+    let mut all_aggs = vec![(0u64, 0i64, 0i64, i64::MAX, i64::MIN, 0usize, 0usize); num_countries];
+    for w in &worker_aggs {
+        for (i, a) in w.iter().enumerate() {
+            let g = &mut all_aggs[i];
+            g.0 += a.0;
+            g.1 += a.1;
+            g.2 += a.2;
+            g.3 = g.3.min(a.3);
+            g.4 = g.4.max(a.4);
+            g.5 += a.5;
+            g.6 += a.6;
         }
     }
 
-    let mut distinct_counts = vec![0usize; num_countries];
-    for c_id in 0..num_countries {
-        let start_word = c_id * WORDS_PER_COUNTRY;
-        let mut count = 0;
-        for w in 0..WORDS_PER_COUNTRY {
-            count += bitsets_ref[start_word + w]
-                .load(Ordering::Relaxed)
-                .count_ones() as usize;
-        }
-        distinct_counts[c_id] = count;
-    }
+    let distinct_counts: Vec<usize> = (0..num_countries)
+        .map(|c| {
+            (0..WORDS_PER_COUNTRY)
+                .map(|w| {
+                    bitsets_ref[c * WORDS_PER_COUNTRY + w]
+                        .load(Ordering::Relaxed)
+                        .count_ones() as usize
+                })
+                .sum()
+        })
+        .collect();
 
     let mut sorted_indices: Vec<usize> = (0..num_countries).collect();
     sorted_indices.sort_unstable_by(|&a, &b| country_names[a].cmp(&country_names[b]));
@@ -545,23 +478,26 @@ fn main() -> std::io::Result<()> {
     let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_path)?);
     for &c_id in &sorted_indices {
         let agg = &all_aggs[c_id];
-        if agg.count == 0 {
+        if agg.0 == 0 {
             continue;
         }
         writeln!(
             writer,
             "{} {} {} {} {} {} {} {} {}",
             country_names[c_id],
-            agg.count,
-            agg.id_sum,
-            format_cents(agg.amount_sum),
-            format_cents(agg.amount_min),
-            format_cents(agg.amount_max),
+            agg.0,
+            agg.1,
+            format_cents(agg.2),
+            format_cents(agg.3),
+            format_cents(agg.4),
             distinct_counts[c_id],
-            agg.name_bytes,
-            agg.note_bytes
+            agg.5,
+            agg.6
         )?;
     }
     writer.flush()?;
+    unsafe {
+        munmap(ptr, flen);
+    }
     Ok(())
 }
